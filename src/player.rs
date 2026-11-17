@@ -91,24 +91,187 @@ impl NabyTune {
         .detach();
     }
 
-    /// Queues songs like `video_id` after the last one (autoplay), none twice.
-    pub(crate) fn extend_with_radio(&mut self, video_id: String, cx: &mut Context<Self>) {
+    /// Toggles smart vibe-matched Autoplay on or off, immediately topping up Up Next when turned on.
+    pub(crate) fn toggle_autoplay(&mut self, cx: &mut Context<Self>) {
+        self.autoplay = !self.autoplay;
+        settings::set("autoplay", if self.autoplay { "1" } else { "0" });
+        if self.autoplay {
+            self.toast = Some((t("Autoplay on · similar vibes").into(), Instant::now()));
+            self.ensure_autoplay(cx);
+        } else {
+            self.autoplay_fetching = None;
+            self.toast = Some((t("Autoplay off").into(), Instant::now()));
+        }
+        cx.notify();
+    }
+
+    /// Keeps Up Next stocked with vibe-matched recommendations whenever Autoplay is on
+    /// and 2 or fewer upcoming songs remain.
+    pub(crate) fn ensure_autoplay(&mut self, cx: &mut Context<Self>) {
+        if !self.autoplay || self.radio.is_some() || self.repeat == Repeat::One {
+            return;
+        }
+        let Some(i) = self.index else { return };
+        let remaining = self.queue.len().saturating_sub(i + 1);
+        if remaining > 2 {
+            return;
+        }
+        let Some(seed) = self.queue.last().or_else(|| self.queue.get(i)).cloned() else { return };
+        if self.autoplay_fetching.as_deref() == Some(seed.video_id.as_str()) {
+            return;
+        }
+        self.extend_with_radio(seed, cx);
+    }
+
+    /// Queues vibe-matched songs similar to `seed` after the last song in the queue,
+    /// balancing acoustic/mood vibe closeness with artist variety and personal taste.
+    pub(crate) fn extend_with_radio(&mut self, seed: Track, cx: &mut Context<Self>) {
+        let norm_artist = |s: &str| -> String {
+            s.split(['•', ',', '&', '×', '/'])
+                .next()
+                .unwrap_or(s)
+                .trim()
+                .to_lowercase()
+        };
+
+        let seed_id = seed.video_id.clone();
+        let seed_title = seed.title.to_string();
+        let seed_artist_raw = seed.artist.to_string();
+        let seed_artist = norm_artist(&seed_artist_raw);
+        let is_local = local_files::path_of(&seed_id).is_some();
+
+        let mut taste_artists: HashSet<String> = HashSet::new();
+        for s in self.library.liked.iter().take(60) {
+            let a = norm_artist(&s.artist);
+            if !a.is_empty() {
+                taste_artists.insert(a);
+            }
+        }
+        for s in self.library.history.iter().take(30) {
+            let a = norm_artist(&s.artist);
+            if !a.is_empty() {
+                taste_artists.insert(a);
+            }
+        }
+        let liked_ids: HashSet<String> = self.library.liked.iter().map(|s| s.video_id.clone()).collect();
+        let rec_ids: HashSet<String> = self.recommended.iter().map(|t| t.video_id.clone()).collect();
+
+        self.autoplay_fetching = Some(seed_id.clone());
+        cx.notify();
+
         let youtube = self.youtube.clone();
         cx.spawn(async move |this, cx| {
-            let found = cx.background_executor().spawn(async move { youtube.radio(&video_id) }).await;
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    let yt_id = if is_local {
+                        let query = format!("{seed_title} {seed_artist_raw}");
+                        youtube
+                            .search(&query)
+                            .ok()
+                            .and_then(|list| list.into_iter().next())
+                            .map(|item| item.video_id)
+                            .unwrap_or_default()
+                    } else {
+                        seed_id.clone()
+                    };
+                    if yt_id.is_empty() {
+                        return Vec::new();
+                    }
+                    youtube.radio(&yt_id).unwrap_or_default()
+                })
+                .await;
+
             let _ = this.update(cx, |app, cx| {
-                let Ok(found) = found else { return };
-                let mut added = 0;
-                for item in found {
-                    if added == 20 {
-                        break;
+                app.autoplay_fetching = None;
+                if !app.autoplay || app.radio.is_some() {
+                    cx.notify();
+                    return;
+                }
+
+                // Collect unique, non-disliked vibe candidates with base vibe + taste affinity scores.
+                let mut pool: Vec<(f32, String, Track)> = Vec::new();
+                for (pos, item) in found.into_iter().enumerate() {
+                    if app.queue.iter().any(|t| t.video_id == item.video_id)
+                        || app.library.is_disliked(&item.video_id)
+                        || pool.iter().any(|(_, _, t)| t.video_id == item.video_id)
+                    {
+                        continue;
                     }
-                    if !app.queue.iter().any(|t| t.video_id == item.video_id) && !app.library.is_disliked(&item.video_id) {
-                        let track = Track::from(item);
-                        app.fetch_art(&track, cx);
-                        app.queue.push(track);
-                        added += 1;
+                    let track = Track::from(item);
+                    let artist_key = norm_artist(&track.artist);
+                    // Preserve YouTube Music's acoustic/mood vibe order as primary signal.
+                    let mut score = 100.0 - (pos as f32) * 1.8;
+                    if !artist_key.is_empty() && artist_key != seed_artist && taste_artists.contains(&artist_key) {
+                        score += 8.0;
                     }
+                    if rec_ids.contains(&track.video_id) {
+                        score += 6.0;
+                    }
+                    if liked_ids.contains(&track.video_id) {
+                        score += 5.0;
+                    }
+                    pool.push((score, artist_key, track));
+                }
+
+                // Fallback to personalized Home recommendations if radio came back empty.
+                if pool.is_empty() {
+                    for (pos, track) in app.recommended.clone().into_iter().enumerate() {
+                        if app.queue.iter().any(|t| t.video_id == track.video_id)
+                            || app.library.is_disliked(&track.video_id)
+                            || pool.iter().any(|(_, _, t)| t.video_id == track.video_id)
+                        {
+                            continue;
+                        }
+                        let artist_key = norm_artist(&track.artist);
+                        pool.push((80.0 - (pos as f32) * 2.0, artist_key, track));
+                    }
+                }
+
+                // Greedy vibe-preserving diversity selection:
+                // Prioritizes close vibes from varied artists, while still allowing the same artist
+                // spaced out naturally when its vibe matches strongly.
+                let mut last_artist = seed_artist.clone();
+                let mut artist_counts: HashMap<String, usize> = HashMap::new();
+                if !seed_artist.is_empty() {
+                    artist_counts.insert(seed_artist, 1);
+                }
+
+                let mut added = 0usize;
+                while added < 15 && !pool.is_empty() {
+                    let mut best_idx = 0usize;
+                    let mut best_eff = f32::NEG_INFINITY;
+                    for (idx, (base_score, artist_key, _)) in pool.iter().enumerate() {
+                        let mut eff = *base_score;
+                        if !artist_key.is_empty() {
+                            if *artist_key == last_artist {
+                                eff -= 45.0;
+                            }
+                            let count = artist_counts.get(artist_key).copied().unwrap_or(0);
+                            eff -= (count as f32) * 18.0;
+                        }
+                        if eff > best_eff {
+                            best_eff = eff;
+                            best_idx = idx;
+                        }
+                    }
+                    let (_, artist_key, track) = pool.remove(best_idx);
+                    if !artist_key.is_empty() {
+                        *artist_counts.entry(artist_key.clone()).or_insert(0) += 1;
+                        last_artist = artist_key;
+                    }
+                    app.fetch_art(&track, cx);
+                    app.queue.push(track);
+                    added += 1;
+                }
+
+                if added > 0 {
+                    if app.shuffle && app.shuffle_next.is_none() {
+                        app.shuffle_next = app.pick_shuffle();
+                    }
+                    app.prefetch_next(cx);
+                    app.prefetch_next_cover(cx);
+                    app.save_session();
                 }
                 cx.notify();
             });
@@ -146,7 +309,13 @@ impl NabyTune {
             self.cover_large = Some(big.cover_large.clone());
             self.ambient = Some(big.glow.clone());
             self.stage_art = Some(big.art.clone());
+            self.vinyl_base = Some(big.vinyl_base.clone());
             appearance::set_cover_colour(big.colour);
+        } else {
+            self.vinyl_base = source.as_ref().map(|s| ambient::vinyl_base(s, 256));
+        }
+        if let Some((a, _)) = &mut self.vinyl_frame {
+            *a = -999.0;
         }
 
         self.generation += 1;
@@ -243,7 +412,7 @@ impl NabyTune {
     pub(crate) fn loaded(&mut self, generation: u64, track: &Track, result: anyhow::Result<Loaded>, fade: bool, cx: &mut Context<Self>) {
         let lyric_id = track.video_id.clone();
         let saved = library::Saved::from(track);
-        let (title, artist) = (track.title.to_string(), track.artist.to_string());
+        let (title, artist) = (track.title.to_string(), youtube::clean_artist(&track.artist));
         let cover_url = track.thumbnail.as_ref().map(|url| youtube::sized(url, 544));
         self.loading = false;
         match result {
@@ -255,6 +424,10 @@ impl NabyTune {
                 }
                 if let Some(big) = loaded.big {
                     appearance::set_cover_colour(big.colour);
+                    self.vinyl_base = Some(big.vinyl_base.clone());
+                    if let Some((a, _)) = &mut self.vinyl_frame {
+                        *a = -999.0;
+                    }
                     if self.ambient.is_none() {
                         self.ambient = Some(big.glow.clone());
                         self.ambient_motion = MotionState::default();
@@ -273,10 +446,14 @@ impl NabyTune {
                 self.lossless_from = loaded.lossless_from.clone();
                 self.library.played(saved);
                 self.library.save();
-                // The queue's last song: line up songs like it, as autoplay does.
-                if self.radio.is_none() && self.autoplay && self.index.is_some_and(|i| i + 1 >= self.queue.len()) && !self.shuffle && self.repeat == Repeat::Off {
-                    self.extend_with_radio(lyric_id.clone(), cx);
+                // Update "Played lately" in real time as songs play:
+                let recent: Vec<Track> = self.library.history.iter().take(8).map(Track::from).collect();
+                for r in &recent {
+                    self.fetch_art(r, cx);
                 }
+                self.home = Listing::new(recent);
+                // Keep Up Next stocked with vibe-matched recommendations when Autoplay is on.
+                self.ensure_autoplay(cx);
                 let fade = if fade { Duration::from_secs(self.crossfade as u64) } else { Duration::ZERO };
                 self.audio.load(generation, loaded.bytes, self.output_volume(), self.playing, fade);
                 // Coming back to where the last session left off.
@@ -284,8 +461,21 @@ impl NabyTune {
                     self.audio.seek(at.min(loaded.length));
                 }
                 if let Some(media) = &mut self.media {
-                    media.track(&title, &artist, cover_url.as_deref(), Some(loaded.length));
+                    let album = track.detail.split_once(" • ").map(|(_, a)| a.trim()).filter(|a| !a.is_empty());
+                    media.track(&title, &artist, album, cover_url.as_deref(), Some(loaded.length));
                     media.state(self.playing, Duration::ZERO);
+                }
+                if let Some(bridge) = &self.bridge {
+                    let album = track.detail.split_once(" • ").map(|(_, a)| a.trim()).filter(|a| !a.is_empty());
+                    bridge.broadcast_track(
+                        &title,
+                        &artist,
+                        album,
+                        cover_url.as_deref(),
+                        loaded.length,
+                        &lyric_id,
+                        self.playing,
+                    );
                 }
                 self.on_track_changed(cx);
                 self.fetch_lyrics(generation, lyric_id, title, artist, loaded.length, cx);
@@ -366,6 +556,15 @@ impl NabyTune {
         let playing = self.playing;
         if let Some(media) = &mut self.media {
             media.state(playing, position);
+        }
+        if let Some(bridge) = &self.bridge {
+            bridge.broadcast_state(playing);
+        }
+        if let Some(tray) = &self.tray {
+            tray.set_playing(playing);
+        }
+        if let Some(tb) = &self.taskbar {
+            tb.set_playing(playing);
         }
     }
 

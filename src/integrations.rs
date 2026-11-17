@@ -18,12 +18,34 @@ impl NabyTune {
         self.listen_start();
         self.prefetch_next(cx);
         self.radio_top_up(cx);
+        self.ensure_autoplay(cx);
         self.save_session();
         self.update_tray();
     }
 
     /// Every tick (a few times a second).
     pub(crate) fn tick_integrations(&mut self, cx: &mut Context<Self>) {
+        if self.bridge.is_none() {
+            self.bridge = crate::bridge::Bridge::new();
+        }
+        for event in self.bridge.as_ref().map(|b| b.events()).unwrap_or_default() {
+            match event {
+                crate::bridge::BridgeEvent::PlayPause => self.toggle(cx),
+                crate::bridge::BridgeEvent::Next => self.skip(1, cx),
+                crate::bridge::BridgeEvent::Previous => self.skip(-1, cx),
+                crate::bridge::BridgeEvent::ToggleWindow => toggle_window(self.hwnd),
+                crate::bridge::BridgeEvent::Seek(to) => self.seek_to(to),
+            }
+            cx.notify();
+        }
+        for event in self.taskbar.as_ref().map(|tb| tb.events()).unwrap_or_default() {
+            match event {
+                crate::taskbar::TaskbarEvent::Previous => self.skip(-1, cx),
+                crate::taskbar::TaskbarEvent::PlayPause => self.toggle(cx),
+                crate::taskbar::TaskbarEvent::Next => self.skip(1, cx),
+            }
+            cx.notify();
+        }
         for event in self.tray.as_ref().map(|t| t.events()).unwrap_or_default() {
             match event {
                 tray::TrayEvent::Show => show_window(self.hwnd),
@@ -135,12 +157,18 @@ impl NabyTune {
     }
 
     fn update_tray(&self) {
-        let Some(tray) = &self.tray else { return };
-        match self.current() {
-            Some(t) => tray.set_tooltip(&format!("{} — {}", t.title, t.artist)),
-            None => tray.set_tooltip("NabyTune"),
+        let tip = match self.current() {
+            Some(t) => format!("{} — {}", t.title, t.artist),
+            None => "NabyTune".to_string(),
+        };
+        if let Some(tray) = &self.tray {
+            tray.set_tooltip(&tip);
+            tray.set_playing(self.playing);
         }
-        tray.set_playing(self.playing);
+        if let Some(tb) = &self.taskbar {
+            tb.set_tooltip(&tip);
+            tb.set_playing(self.playing);
+        }
     }
 
     // ---- Discord -------------------------------------------------------------------
@@ -203,14 +231,55 @@ impl NabyTune {
 }
 
 pub(crate) fn show_window(hwnd: isize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
     if hwnd == 0 {
         return;
     }
     unsafe {
-        let hwnd = hwnd as _;
-        ShowWindow(hwnd, if IsIconic(hwnd) != 0 { SW_RESTORE } else { SW_SHOW });
-        SetForegroundWindow(hwnd);
+        let hwnd_ptr = hwnd as windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId,
+            SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+        };
+        use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+
+        ShowWindow(hwnd_ptr, SW_RESTORE);
+        ShowWindow(hwnd_ptr, SW_SHOW);
+        BringWindowToTop(hwnd_ptr);
+
+        let fg = GetForegroundWindow();
+        let cur_thread = GetCurrentThreadId();
+        let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+
+        if fg_thread != 0 && fg_thread != cur_thread {
+            AttachThreadInput(cur_thread, fg_thread, 1);
+            BringWindowToTop(hwnd_ptr);
+            SetForegroundWindow(hwnd_ptr);
+            AttachThreadInput(cur_thread, fg_thread, 0);
+        } else {
+            BringWindowToTop(hwnd_ptr);
+            SetForegroundWindow(hwnd_ptr);
+        }
+    }
+}
+
+pub(crate) fn toggle_window(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd_ptr = hwnd as windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, IsIconic, IsWindowVisible, ShowWindow, SW_MINIMIZE,
+        };
+        let fg = GetForegroundWindow();
+        let is_visible = IsWindowVisible(hwnd_ptr) != 0;
+        let is_minimized = IsIconic(hwnd_ptr) != 0;
+
+        if fg == hwnd_ptr && is_visible && !is_minimized {
+            ShowWindow(hwnd_ptr, SW_MINIMIZE);
+        } else {
+            show_window(hwnd);
+        }
     }
 }
 

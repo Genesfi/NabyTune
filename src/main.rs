@@ -13,6 +13,7 @@ mod addon;
 mod ambient;
 mod appearance;
 mod audio;
+mod bridge;
 mod decoder;
 mod desktop_lyrics;
 mod dsp;
@@ -46,6 +47,7 @@ mod snapshot;
 mod stats;
 mod stats_page;
 mod track_menu;
+mod taskbar;
 mod tray;
 mod updater;
 mod updates;
@@ -260,6 +262,7 @@ impl Look {
 #[derive(Clone, Copy, PartialEq)]
 enum StageLayout {
     Side,
+    UpNext,
     Center,
     Bleed,
     Lyrics,
@@ -267,10 +270,18 @@ enum StageLayout {
 }
 
 impl StageLayout {
-    const ALL: [StageLayout; 5] = [StageLayout::Side, StageLayout::Center, StageLayout::Bleed, StageLayout::Lyrics, StageLayout::Card];
+    const ALL: [StageLayout; 6] = [
+        StageLayout::Side,
+        StageLayout::UpNext,
+        StageLayout::Center,
+        StageLayout::Bleed,
+        StageLayout::Lyrics,
+        StageLayout::Card,
+    ];
     fn name(self) -> &'static str {
         t(match self {
             StageLayout::Side => "Side by side",
+            StageLayout::UpNext => "Up next",
             StageLayout::Center => "Center",
             StageLayout::Bleed => "Full cover",
             StageLayout::Lyrics => "Lyrics only",
@@ -280,6 +291,7 @@ impl StageLayout {
     fn key(self) -> &'static str {
         match self {
             StageLayout::Side => "side",
+            StageLayout::UpNext => "upnext",
             StageLayout::Center => "center",
             StageLayout::Bleed => "bleed",
             StageLayout::Lyrics => "lyrics",
@@ -287,6 +299,9 @@ impl StageLayout {
         }
     }
     fn from_key(key: &str) -> Option<Self> {
+        if key == "vinyl" {
+            return Some(StageLayout::UpNext);
+        }
         Self::ALL.into_iter().find(|l| l.key() == key)
     }
 }
@@ -336,6 +351,7 @@ struct BigCover {
     glow: Arc<RenderImage>,
     art: StageArt,
     colour: Option<u32>,
+    vinyl_base: Arc<RgbaImage>,
 }
 
 impl BigCover {
@@ -346,12 +362,13 @@ impl BigCover {
             glow: ambient::ambient(image, 0.85),
             art: StageArt { soft: ambient::soft(image), colors: ambient::palette(image) },
             colour: ambient::accent_from(image),
+            vinyl_base: ambient::vinyl_base(image, 256),
         }
     }
 }
 
-/// How many big covers are kept: the last songs and the next one (each ~4 MB).
-const BIG_COVERS: usize = 4;
+/// How many big covers are kept: the last song and the next one (each ~4 MB).
+const BIG_COVERS: usize = 2;
 
 /// Backgrounds made from the current cover: lightly blurred, and its two main colours.
 #[derive(Clone)]
@@ -367,8 +384,8 @@ enum LookAnchor {
     Panel,
 }
 const STAGE_COVER: f32 = 440.0;
-/// The full-screen cover's pixel size: enough for the largest layout.
-const STAGE_ART: u32 = 720;
+/// The full-screen cover's pixel size: matches YouTube's 544 px source cover.
+const STAGE_ART: u32 = 544;
 
 #[derive(Clone)]
 struct Track {
@@ -384,11 +401,19 @@ struct Track {
 
 impl From<&library::Saved> for Track {
     fn from(s: &library::Saved) -> Self {
+        let artist = youtube::clean_artist(&s.artist);
+        let detail = if s.detail.contains(" • ") {
+            let parts: Vec<&str> = s.detail.split(" • ").collect();
+            let album = parts.get(1).unwrap_or(&"");
+            if album.is_empty() { artist.clone() } else { format!("{} • {}", artist, album) }
+        } else {
+            artist.clone()
+        };
         Self {
             video_id: s.video_id.clone(),
             title: s.title.clone().into(),
-            artist: s.artist.clone().into(),
-            detail: s.detail.clone().into(),
+            artist: artist.into(),
+            detail: detail.into(),
             duration: s.duration.clone().into(),
             thumbnail: s.thumbnail.clone(),
             local: None,
@@ -398,10 +423,11 @@ impl From<&library::Saved> for Track {
 
 impl From<&Track> for library::Saved {
     fn from(t: &Track) -> Self {
+        let artist = youtube::clean_artist(&t.artist.to_string());
         Self {
             video_id: t.video_id.clone(),
             title: t.title.to_string(),
-            artist: t.artist.to_string(),
+            artist: artist.clone(),
             detail: t.detail.to_string(),
             duration: t.duration.to_string(),
             thumbnail: t.thumbnail.clone(),
@@ -417,11 +443,12 @@ struct PlaylistMenu {
 
 impl From<youtube::SearchItem> for Track {
     fn from(s: youtube::SearchItem) -> Self {
-        let detail = if s.album.is_empty() { s.artist.clone() } else { format!("{} • {}", s.artist, s.album) };
+        let artist = youtube::clean_artist(&s.artist);
+        let detail = if s.album.is_empty() { artist.clone() } else { format!("{} • {}", artist, s.album) };
         Self {
             video_id: s.video_id,
             title: s.title.into(),
-            artist: s.artist.into(),
+            artist: artist.into(),
             detail: detail.into(),
             duration: s.duration.into(),
             thumbnail: s.thumbnail,
@@ -442,8 +469,8 @@ const ART_BUDGET: usize = 64 << 20;
 /// Cards show at 168 px: their covers are fetched a little larger and kept at 256 px, sharp up
 /// to 150% display scaling (twice the size, as before, cost twice the memory for every cover
 /// on a Home of twenty shelves).
-const CARD_FETCH: u32 = 264;
-const CARD_KEEP: u32 = 256;
+const CARD_FETCH: u32 = 226;
+const CARD_KEEP: u32 = 176;
 
 /// Fetches what `start` needs to play a track: lossless from the addons when one has it,
 /// else YouTube's stream; and its big cover when `big` names one to fetch.
@@ -719,6 +746,10 @@ struct NabyTune {
 
     /// Windows' media controls and keys.
     media: Option<media::Media>,
+    /// FocusGrow & DynamicNotification WebSocket bridge.
+    bridge: Option<bridge::Bridge>,
+    /// Windows Taskbar thumbnail preview media buttons (Prev / Play-Pause / Next).
+    taskbar: Option<taskbar::Taskbar>,
 
     // ---- Pages
     tab: Tab,
@@ -864,8 +895,10 @@ struct NabyTune {
     playlist_menu_closed: Instant,
     /// A playlist whose Delete was clicked once: the next click deletes it.
     delete_armed: Option<usize>,
-    /// When the queue's last song starts, songs like it are queued after it.
+    /// When the queue runs low, vibe-matched recommended songs automatically line up next.
     autoplay: bool,
+    /// Video ID currently being fetched for autoplay recommendations (prevents duplicate calls).
+    autoplay_fetching: Option<String>,
     /// The radio playing, if one is: it keeps the queue topped up.
     radio: Option<radio::RadioState>,
     /// The song being listened to, counted for Stats; and the Stats page.
@@ -943,6 +976,18 @@ struct NabyTune {
     /// Quick setup's step, while it shows (first run).
     setup_step: Option<usize>,
     setup_motion: MotionState,
+
+    /// Brief floating notification toast (e.g. "Playing next", "Added to queue").
+    toast: Option<(SharedString, Instant)>,
+    /// Real-time vinyl rotation base image, transient GPU frames, and animation state.
+    vinyl_base: Option<Arc<RgbaImage>>,
+    vinyl_frame: Option<(f32, Arc<RenderImage>)>,
+    vinyl_prev_frame: Option<Arc<RenderImage>>,
+    vinyl_mode: bool,
+    vinyl_rotate: bool,
+    vinyl_speed: f32,
+    vinyl_state: Rc<Cell<(f32, Instant)>>,
+    vinyl_speed_bar: Rc<Cell<(f32, f32)>>,
 
     // ---- Motion
     dock_motion: MotionState,
@@ -1043,6 +1088,8 @@ impl NabyTune {
             search,
             _search: subscription,
             media: None,
+            bridge: None,
+            taskbar: None,
             tab: Tab::Home,
             home: Listing::new(seeds),
             feed: Feed::Loading,
@@ -1077,6 +1124,16 @@ impl NabyTune {
             stage_layout: settings::get("stage_layout").and_then(|k| StageLayout::from_key(&k)).unwrap_or(StageLayout::Side),
             stage_backdrop: settings::get("stage_backdrop").and_then(|k| StageBackdrop::from_key(&k)).unwrap_or(StageBackdrop::Ambient),
             visual: settings::get("visualizer").and_then(|k| visualizer::Visual::from_key(&k)).unwrap_or(visualizer::Visual::Pulse),
+            toast: None,
+            vinyl_base: None,
+            vinyl_frame: None,
+            vinyl_prev_frame: None,
+            vinyl_mode: settings::get("vinyl_mode")
+                .map_or_else(|| settings::get("stage_layout").as_deref() == Some("vinyl"), |v| v != "0"),
+            vinyl_rotate: settings::get("vinyl_rotate").map_or(true, |v| v != "0"),
+            vinyl_speed: settings::get("vinyl_speed").and_then(|v| v.parse().ok()).unwrap_or(8.0),
+            vinyl_state: Rc::new(Cell::new((0.0, Instant::now()))),
+            vinyl_speed_bar: Rc::new(Cell::new((0.0, 180.0))),
             stage_art: None,
             layout_menu: false,
             layout_menu_closed: Instant::now(),
@@ -1146,6 +1203,7 @@ impl NabyTune {
             playlist_menu_closed: Instant::now(),
             delete_armed: None,
             autoplay: settings::get("autoplay").is_none_or(|v| v != "0"),
+            autoplay_fetching: None,
             radio: None,
             listening: None,
             stats: stats_page::StatsView::default(),
@@ -1216,7 +1274,9 @@ impl NabyTune {
         }
         app.load_feed(cx);
         app.media = media::Media::new(window);
+        app.bridge = bridge::Bridge::new();
         app.set_up_window(window, cx);
+        app.taskbar = taskbar::Taskbar::new(window);
         app.restore_session(cx);
         app
     }
@@ -1251,6 +1311,14 @@ impl Render for NabyTune {
             self.images_swept = Instant::now();
             for image in ambient::unused_images() {
                 cx.drop_image(image, Some(window));
+            }
+        }
+        if !self.full_screen || !self.vinyl_mode {
+            if let Some((_, f)) = self.vinyl_frame.take() {
+                cx.drop_image(f, Some(window));
+            }
+            if let Some(f) = self.vinyl_prev_frame.take() {
+                cx.drop_image(f, Some(window));
             }
         }
         // ---- Ambient backdrop: the new cover's glow fades in over the last one.
@@ -1315,6 +1383,50 @@ impl Render for NabyTune {
             rise.apply(div().child(dock))
         });
         let stage = self.stage(window, cx);
+        let toast = self.toast.as_ref().and_then(|(msg, at)| {
+            let elapsed = at.elapsed();
+            if elapsed >= Duration::from_millis(2400) {
+                return None;
+            }
+            window.request_animation_frame();
+            let alpha = if elapsed > Duration::from_millis(2000) {
+                1.0 - (elapsed.as_secs_f32() - 2.0) / 0.4
+            } else {
+                1.0
+            };
+            Some(
+                deferred(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom(px(if self.index.is_some() && !self.full_screen { 96.0 } else { 28.0 }))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px(px(16.0))
+                                .py(px(8.0))
+                                .rounded_full()
+                                .bg(rgba(GLASS))
+                                .backdrop_blur(px(24.0))
+                                .border_1()
+                                .border_color(rgba(STROKE))
+                                .shadow_lg()
+                                .opacity(alpha.clamp(0.0, 1.0))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().size(px(7.0)).rounded_full().bg(rgb(accent())))
+                                .child(div().text_size(px(12.5)).font_weight(FontWeight::MEDIUM).text_color(rgb(0xffffff)).child(msg.clone())),
+                        ),
+                )
+                .with_priority(3),
+            )
+        });
+        if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_millis(2400)) {
+            self.toast = None;
+        }
         div()
             .id("nabytune")
             .key_context("NabyTune")
@@ -1432,6 +1544,7 @@ impl Render for NabyTune {
             .children(menu)
             .children(track_menu)
             .children(setup)
+            .children(toast)
     }
 }
 

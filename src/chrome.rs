@@ -220,11 +220,96 @@ impl NabyTune {
                     })),
             );
         }
+        if self.autoplay_fetching.is_some() {
+            list = list.child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.0))
+                    .text_color(rgba(TERTIARY))
+                    .child(div().size(px(6.0)).rounded_full().bg(rgb(accent())))
+                    .child(t("Finding similar vibes…")),
+            );
+        } else if !self.autoplay && self.queue.len().saturating_sub(i + 1) == 0 {
+            list = list.child(
+                div()
+                    .id("up-next-enable-autoplay")
+                    .mx_2()
+                    .mt_3()
+                    .p_3()
+                    .rounded(px(10.0))
+                    .bg(rgba(SUBTLE))
+                    .border_1()
+                    .border_color(rgba(STROKE))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(SUBTLE_STRONG)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_autoplay(cx)))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xffffff))
+                            .child(t("Play similar vibes automatically")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgba(SECONDARY))
+                            .child(t("Turn on Autoplay to keep matching songs lined up next")),
+                    ),
+            );
+        }
+
+        let autoplay_on = self.autoplay;
+        let autoplay_toggle = div()
+            .id("up-next-autoplay")
+            .h(px(26.0))
+            .px(px(10.0))
+            .rounded_full()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .border_1()
+            .border_color(if autoplay_on { rgb(accent()) } else { rgba(STROKE) })
+            .bg(if autoplay_on { rgba(0xffffff18) } else { rgba(SUBTLE) })
+            .hover(|s| s.bg(rgba(SUBTLE_STRONG)))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_autoplay(cx)))
+            .child(
+                div()
+                    .size(px(6.0))
+                    .rounded_full()
+                    .bg(if autoplay_on { rgb(accent()) } else { rgba(TERTIARY) }),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .font_weight(if autoplay_on { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                    .text_color(if autoplay_on { rgb(0xffffff) } else { rgba(SECONDARY) })
+                    .child(t("Autoplay")),
+            );
+
         div()
             .size_full()
             .flex()
             .flex_col()
-            .child(div().px_4().pt_4().pb_2().text_size(px(16.0)).font_weight(FontWeight::SEMIBOLD).child(t("Up Next")))
+            .child(
+                div()
+                    .px_4()
+                    .pt_4()
+                    .pb_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_size(px(16.0)).font_weight(FontWeight::SEMIBOLD).child(t("Up Next")))
+                    .child(autoplay_toggle),
+            )
             .children(self.radio_header(cx))
             .child(list)
             .into_any_element()

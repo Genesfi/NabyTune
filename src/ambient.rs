@@ -13,7 +13,7 @@ use gpui::RenderImage;
 use image::{imageops::FilterType, Frame, RgbaImage};
 
 /// The ambient image's size. The GPU stretches it to the window; it is smooth enough not to show.
-const AMBIENT: u32 = 512;
+const AMBIENT: u32 = 256;
 /// The blur works on a thumbnail this size; at 512 px out, sigma 4.5 here is roughly 58 px.
 const THUMB: u32 = 40;
 
@@ -98,6 +98,102 @@ pub fn square(source: &RgbaImage) -> RgbaImage {
 /// The cover at `size`×`size` for display.
 pub fn cover(source: &RgbaImage, size: u32) -> Arc<RenderImage> {
     render_image(image::imageops::resize(&square(source), size, size, FilterType::Lanczos3))
+}
+
+/// Prepares a compact square cover image for real-time per-frame vinyl rotation (only ~256 KB).
+pub fn vinyl_base(source: &RgbaImage, size: u32) -> Arc<RgbaImage> {
+    Arc::new(image::imageops::resize(&square(source), size, size, FilterType::Triangle))
+}
+
+/// Renders ONE vinyl frame at an exact floating-point `angle_deg` using 16.16 fixed-point
+/// bilinear interpolation (~0.15 ms per frame). Not pushed into `MADE`: caller drops the
+/// previous frame directly via `window.drop_image` for constant O(1) RAM & GPU atlas usage.
+pub fn vinyl_frame_at(base: &RgbaImage, angle_deg: f32) -> Arc<RenderImage> {
+    let size = base.width().min(base.height());
+    let sz = size as usize;
+    let row_stride = sz * 4;
+    let max_u = size.saturating_sub(1);
+    let base_raw = base.as_raw();
+
+    let w = size as f32;
+    let cx = (w - 1.0) * 0.5;
+    let cy = cx;
+    let outer_r = w * 0.5 + 1.0;
+    let outer_r2 = outer_r * outer_r;
+
+    let rad = angle_deg.to_radians();
+    let scale = 0.992f32;
+    let cos_a = rad.cos() * scale;
+    let sin_a = rad.sin() * scale;
+    const FP: f32 = 65536.0;
+    let cos_fp = (cos_a * FP) as i32;
+    let sin_fp = (sin_a * FP) as i32;
+
+    let mut out = RgbaImage::new(size, size);
+    let out_raw: &mut [u8] = out.as_mut();
+
+    for y in 0..size {
+        let dy = y as f32 - cy;
+        let dx_sq = outer_r2 - dy * dy;
+        if dx_sq <= 0.0 {
+            continue;
+        }
+        let dx_max = dx_sq.sqrt();
+        let x_start = ((cx - dx_max).floor() as i32).max(0) as u32;
+        let x_end = ((cx + dx_max).ceil() as i32).min(size as i32 - 1) as u32;
+
+        let dx0 = x_start as f32 - cx;
+        let mut sx_fp = ((cx + dx0 * cos_a + dy * sin_a) * FP) as i32;
+        let mut sy_fp = ((cy - dx0 * sin_a + dy * cos_a) * FP) as i32;
+        let row_out = (y as usize) * row_stride;
+
+        for x in x_start..=x_end {
+            let x0 = (sx_fp >> 16) as u32;
+            let y0 = (sy_fp >> 16) as u32;
+            if x0 < max_u && y0 < max_u {
+                let fx = ((sx_fp >> 8) & 0xFF) as u32;
+                let fy = ((sy_fp >> 8) & 0xFF) as u32;
+                let ix = 256 - fx;
+                let iy = 256 - fy;
+                let w00 = ix * iy;
+                let w10 = fx * iy;
+                let w01 = ix * fy;
+                let w11 = fx * fy;
+
+                let i00 = (y0 as usize) * row_stride + (x0 as usize) * 4;
+                let i10 = i00 + 4;
+                let i01 = i00 + row_stride;
+                let i11 = i01 + 4;
+
+                let r = ((base_raw[i00] as u32 * w00
+                    + base_raw[i10] as u32 * w10
+                    + base_raw[i01] as u32 * w01
+                    + base_raw[i11] as u32 * w11)
+                    >> 16) as u8;
+                let g = ((base_raw[i00 + 1] as u32 * w00
+                    + base_raw[i10 + 1] as u32 * w10
+                    + base_raw[i01 + 1] as u32 * w01
+                    + base_raw[i11 + 1] as u32 * w11)
+                    >> 16) as u8;
+                let b = ((base_raw[i00 + 2] as u32 * w00
+                    + base_raw[i10 + 2] as u32 * w10
+                    + base_raw[i01 + 2] as u32 * w01
+                    + base_raw[i11 + 2] as u32 * w11)
+                    >> 16) as u8;
+
+                let oi = row_out + (x as usize) * 4;
+                // GPUI expects BGRA
+                out_raw[oi] = b;
+                out_raw[oi + 1] = g;
+                out_raw[oi + 2] = r;
+                out_raw[oi + 3] = 255;
+            }
+            sx_fp = sx_fp.wrapping_add(cos_fp);
+            sy_fp = sy_fp.wrapping_sub(sin_fp);
+        }
+    }
+
+    Arc::new(RenderImage::new(vec![Frame::new(out)]))
 }
 
 /// The cover, blurred far past recognition and spread to `AMBIENT` px, with alpha `alpha`.

@@ -38,7 +38,8 @@ impl NabyTune {
     pub(crate) fn play_next(&mut self, track: Track, cx: &mut Context<Self>) {
         match self.index {
             Some(i) => {
-                // Moved, if it's queued already.
+                let title = track.title.to_string();
+                // Moved, if it's queued already (not the currently playing slot).
                 if let Some(at) = self.queue.iter().position(|t| t.video_id == track.video_id).filter(|at| *at != i) {
                     self.queue.remove(at);
                     if at < i {
@@ -48,23 +49,31 @@ impl NabyTune {
                 let i = self.index.unwrap_or(0);
                 self.fetch_art(&track, cx);
                 self.queue.insert(i + 1, track);
-                self.queue_changed(cx);
+                self.toast = Some((tf("Playing next: {}", &[&title]).into(), Instant::now()));
+                self.queue_changed_with_next(Some(i + 1), cx);
             }
             None => self.play_from(vec![track], 0, cx),
         }
     }
 
-    /// Puts `track` at the end of the queue (or plays it, when nothing does).
+    /// Puts `track` at the very bottom of the queue (or plays it, when nothing does).
     pub(crate) fn add_to_queue(&mut self, track: Track, cx: &mut Context<Self>) {
-        if self.index.is_none() {
+        let Some(cur) = self.index else {
             self.play_from(vec![track], 0, cx);
             return;
+        };
+        let title = track.title.to_string();
+        // If it's already sitting elsewhere in the queue (e.g. already played earlier), move it to the bottom.
+        if let Some(at) = self.queue.iter().position(|t| t.video_id == track.video_id).filter(|at| *at != cur) {
+            self.queue.remove(at);
+            if at < cur {
+                self.index = Some(cur - 1);
+            }
         }
-        if !self.queue.iter().any(|t| t.video_id == track.video_id) {
-            self.fetch_art(&track, cx);
-            self.queue.push(track);
-            self.queue_changed(cx);
-        }
+        self.fetch_art(&track, cx);
+        self.queue.push(track);
+        self.toast = Some((tf("Added to queue: {}", &[&title]).into(), Instant::now()));
+        self.queue_changed(cx);
     }
 
     /// Takes song `at` out of the queue (not the playing one).
@@ -82,8 +91,12 @@ impl NabyTune {
 
     /// What comes next may have changed: shuffle's pick and the song fetched ahead follow.
     pub(crate) fn queue_changed(&mut self, cx: &mut Context<Self>) {
+        self.queue_changed_with_next(None, cx);
+    }
+
+    fn queue_changed_with_next(&mut self, pinned_next: Option<usize>, cx: &mut Context<Self>) {
         if self.shuffle {
-            self.shuffle_next = self.pick_shuffle();
+            self.shuffle_next = pinned_next.or_else(|| self.pick_shuffle());
         }
         let next = self.next_index().and_then(|n| self.queue.get(n)).map(|t| t.video_id.clone());
         if self.prefetched.as_ref().is_some_and(|(id, _)| Some(id) != next.as_ref()) {
@@ -91,6 +104,7 @@ impl NabyTune {
         }
         self.prefetch_next(cx);
         self.prefetch_next_cover(cx);
+        self.ensure_autoplay(cx);
         self.save_session();
         cx.notify();
     }

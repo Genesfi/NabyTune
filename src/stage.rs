@@ -361,6 +361,324 @@ impl NabyTune {
             .child(div().w_full().flex().justify_center().child(transport))
     }
 
+    /// Renders either the spinning vinyl disc (when `vinyl_mode` is on) or the standard rounded cover.
+    pub(crate) fn stage_cover(&mut self, size: f32, radius: f32, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        if self.vinyl_mode {
+            div().child(self.vinyl_disc(size, window, cx))
+        } else {
+            self.cover_art(self.cover_large.clone(), size, radius).shadow_lg()
+        }
+    }
+
+    /// A rotating vinyl record with concentric grooves, circular album label,
+    /// and a frosted metallic glass center spindle hole.
+    pub(crate) fn vinyl_disc(&mut self, size: f32, window: &mut Window, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        if self.playing && !self.loading {
+            window.request_animation_frame();
+        }
+
+        // Gentle beat pulsing inside a fixed-size wrapper so text/layout never jitters
+        let scope = self.audio.scope();
+        let beat = if self.playing { scope.beat() } else { 0.0 };
+        let level = if self.playing { scope.level() } else { 0.0 };
+        let pulse_scale = 1.0 + (beat * 0.015 + level * 0.008);
+        let actual_size = size * pulse_scale;
+
+        // Smooth continuous visual angle via high-precision delta-time clock (native 60/75/120/144 FPS)
+        let (prev_angle, last_instant) = self.vinyl_state.get();
+        let now = std::time::Instant::now();
+        let angle = if self.vinyl_rotate && self.playing && !self.loading {
+            let dt = (now - last_instant).as_secs_f32().clamp(0.0, 0.05);
+            let speed = self.vinyl_speed.max(0.5);
+            let next_angle = (prev_angle + (dt / speed) * 360.0) % 360.0;
+            self.vinyl_state.set((next_angle, now));
+            next_angle
+        } else {
+            self.vinyl_state.set((prev_angle, now));
+            prev_angle
+        };
+
+        // Real-time per-frame fixed-point bilinear rotation at exact floating-point angle (~0.15 ms, ~0.5 MB RAM)
+        let rotated_frame = if self.vinyl_rotate {
+            if let Some(base) = self.vinyl_base.clone() {
+                let needs_new = match &self.vinyl_frame {
+                    Some((last_angle, _)) => (angle - *last_angle).abs() >= 0.02,
+                    None => true,
+                };
+                if needs_new {
+                    let new_img = ambient::vinyl_frame_at(&base, angle);
+                    if let Some(old_prev) = self.vinyl_prev_frame.take() {
+                        cx.drop_image(old_prev, Some(window));
+                    }
+                    if let Some((_, cur)) = self.vinyl_frame.replace((angle, new_img.clone())) {
+                        self.vinyl_prev_frame = Some(cur);
+                    }
+                    Some(new_img)
+                } else {
+                    self.vinyl_frame.as_ref().map(|(_, img)| img.clone())
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Thin sleek vinyl rim matching user reference (cover artwork fills ~96.5% of disc diameter)
+        let label_size = actual_size * 0.965;
+        let spindle_size = actual_size * 0.17;
+        let hole_size = spindle_size * 0.28;
+
+        let disc = div()
+            .relative()
+            .size(px(actual_size))
+            .flex_none()
+            .rounded_full()
+            .bg(rgb(0x0e0e12))
+            .shadow_2xl()
+            .border_2()
+            .border_color(rgba(0x22222bff))
+            // Thin concentric micro-groove rim
+            .child(
+                div()
+                    .absolute()
+                    .inset(px(actual_size * 0.006))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgba(0xffffff18)),
+            )
+            // Circular album art label
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(label_size))
+                            .rounded_full()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(rgba(0x0000_0066))
+                            .shadow_md()
+                            .map(|d| {
+                                if let Some(frame_img) = rotated_frame {
+                                    return d.child(
+                                        img(frame_img)
+                                            .object_fit(ObjectFit::Cover)
+                                            .size_full()
+                                            .rounded_full(),
+                                    );
+                                }
+                                match self.cover_large.clone() {
+                                    Some(image) => d.child(
+                                        img(image)
+                                            .object_fit(ObjectFit::Cover)
+                                            .size_full()
+                                            .rounded_full()
+                                            .when(!self.cover_sharp, |s| s.blur(px((size * 0.03).clamp(3.0, 14.0)))),
+                                    ),
+                                    None => d.bg(rgba(SUBTLE_STRONG)).child(
+                                        div()
+                                            .size_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .font_family(ICONS)
+                                            .text_size(px(label_size * 0.3))
+                                            .text_color(rgba(SECONDARY))
+                                            .child("\u{E8D6}"),
+                                    ),
+                                }
+                            }),
+                    ),
+            )
+            // Specular sheen light reflections (dual opposing cones)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded_full()
+                    .bg(gpui::linear_gradient(
+                        angle,
+                        gpui::linear_color_stop(rgba(0xffffff22), 0.0),
+                        gpui::linear_color_stop(rgba(0xffffff00), 0.38),
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded_full()
+                    .bg(gpui::linear_gradient(
+                        (angle + 180.0) % 360.0,
+                        gpui::linear_color_stop(rgba(0xffffff22), 0.0),
+                        gpui::linear_color_stop(rgba(0xffffff00), 0.38),
+                    )),
+            )
+            // Frosted metallic glass spindle center (matching YT Music Vinyl & FocusGrow)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(spindle_size))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgba(0xe8ebf2f0))
+                            .backdrop_blur(px(16.0))
+                            .border_2()
+                            .border_color(rgba(0xffffffdd))
+                            .shadow_lg()
+                            .child(
+                                div()
+                                    .size(px(hole_size))
+                                    .rounded_full()
+                                    .bg(rgb(0x0a0a0d))
+                                    .border_1()
+                                    .border_color(rgba(0x33333388))
+                                    .shadow_md(),
+                            ),
+                    ),
+            );
+
+        div()
+            .id("vinyl-disc")
+            .size(px(size))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle(cx);
+            }))
+            .child(disc)
+    }
+
+    /// Up Next mini-preview (next 1-2 tracks) for fullscreen stage view.
+    pub(crate) fn stage_up_next(&self, width: f32, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let cur = self.index?;
+        let upcoming: Vec<(usize, Track)> = self
+            .queue
+            .iter()
+            .enumerate()
+            .skip(cur + 1)
+            .take(2)
+            .map(|(i, t)| (i, t.clone()))
+            .collect();
+
+        if upcoming.is_empty() {
+            return None;
+        }
+
+        let mut container = div()
+            .w(px(width))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_xl()
+            .bg(rgba(0x0000_0033))
+            .border_1()
+            .border_color(rgba(0xffffff14))
+            .backdrop_blur(px(20.0))
+            .shadow_md();
+
+        let header = div()
+            .px_1()
+            .pb_1()
+            .flex()
+            .items_center()
+            .justify_between()
+            .text_size(px(10.0))
+            .font_weight(FontWeight::BOLD)
+            .text_color(rgba(0xffffff88))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().font_family(ICONS).text_size(px(12.0)).child("\u{E8FD}"))
+                    .child(t("Up Next").to_uppercase()),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgba(0xffffff55))
+                    .child(format!("{}/{}", cur + 1, self.queue.len())),
+            );
+
+        container = container.child(header);
+
+        for (idx, track) in upcoming {
+            let art = self.art.get(&track.video_id).map(|a| a.small.clone());
+            let item = div()
+                .id(("stage-next", idx))
+                .h(px(40.0))
+                .w_full()
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_lg()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0xffffff1a)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.index = Some(idx);
+                    this.playing = true;
+                    this.start(cx);
+                }))
+                .child(
+                    div()
+                        .size(px(28.0))
+                        .flex_none()
+                        .rounded_md()
+                        .overflow_hidden()
+                        .bg(rgba(SUBTLE_STRONG))
+                        .map(|d| match art {
+                            Some(image) => d.child(img(image).size_full().object_fit(ObjectFit::Cover)),
+                            None => d.flex().items_center().justify_center().font_family(ICONS).text_size(px(12.0)).text_color(rgba(SECONDARY)).child("\u{E8D6}"),
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .truncate()
+                                .text_color(rgb(0xffffff))
+                                .child(track.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(rgba(0xffffff99))
+                                .truncate()
+                                .child(track.artist.clone()),
+                        ),
+                );
+
+            container = container.child(item);
+        }
+
+        Some(container)
+    }
+
     /// The whole window for the song, in the chosen layout over the chosen background.
     /// Every size follows the window, so a maximised window fills out rather than leaving
     /// a small player in one corner.
@@ -492,18 +810,24 @@ impl NabyTune {
         let subtitle = LyricStyle { text: 19.0, line_height: 26.0, gap: 0.0, pad: 0.0, anchor: 0.5, blur_step: 0.0, blur_max: 0.0 };
 
         let body: AnyElement = match layout {
-            // Cover and controls beside the lyrics, the pair centred as one group.
+            // Cover (or spinning vinyl) and controls beside the lyrics, the pair centred as one group.
             StageLayout::Side => {
                 let size = (area * 0.62).min(vw * 0.3).clamp(240.0, 640.0);
                 let gap = (vw * 0.05).clamp(40.0, 110.0);
                 let room = ((vw - 64.0 - 64.0 - RAIL_ROOM).min(1500.0) - size - gap).max(200.0);
-                // The lyrics get a column of their own width, sized from the window and the
-                // cover, never from the song: the group (cover, gap, column) then sits in the
-                // same place for every song, whether its lines are short or long, and the
-                // words are the same size throughout.
                 let column = room.min(size * 1.45).min(860.0);
-                let info = self.stage_info(&track, Some(cover_frame), size, false, cx);
+                let cover = cover_frame.apply(self.stage_cover(size, (size * 0.035).max(10.0), window, cx));
+                let info = self.stage_info(&track, None, size, self.vinyl_mode, cx);
                 let lyrics = self.lyric_column(&lyric_style((vh * 0.04).min(column * 0.058).clamp(20.0, 48.0), 0.42), window, cx);
+                let left_col = div()
+                    .w(px(size))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .when(self.vinyl_mode, |d| d.items_center())
+                    .gap_4()
+                    .child(cover)
+                    .child(info);
                 div()
                     .size_full()
                     .flex()
@@ -517,15 +841,55 @@ impl NabyTune {
                             .flex()
                             .items_center()
                             .gap(px(gap))
-                            .child(info)
+                            .child(left_col)
                             .child(div().w(px(column)).flex_none().h_full().py(px(24.0)).child(lyrics)),
                     )
                     .into_any_element()
             }
-            // Everything on one axis: the cover, the title, the sung line as a subtitle, controls.
+            // Side by side + Up Next preview card below the controls (supports both Cover and Vinyl mode).
+            StageLayout::UpNext => {
+                let size = (area * 0.60).min(vw * 0.32).clamp(240.0, 560.0);
+                let gap = (vw * 0.05).clamp(40.0, 110.0);
+                let room = ((vw - 64.0 - 64.0 - RAIL_ROOM).min(1500.0) - size - gap).max(200.0);
+                let column = room.min(size * 1.45).min(860.0);
+                let cover = cover_frame.apply(self.stage_cover(size, (size * 0.035).max(10.0), window, cx));
+                let info = self.stage_info(&track, None, size, true, cx);
+                let lyrics = self.lyric_column(&lyric_style((vh * 0.04).min(column * 0.058).clamp(20.0, 48.0), 0.42), window, cx);
+                let up_next = self.stage_up_next(size, cx);
+                let mut left_col = div()
+                    .w(px(size))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_4()
+                    .child(cover)
+                    .child(info);
+                if let Some(next_card) = up_next {
+                    left_col = left_col.child(next_card);
+                }
+                div()
+                    .size_full()
+                    .flex()
+                    .justify_center()
+                    .pl(px(64.0))
+                    .pr(px(64.0 + RAIL_ROOM - 40.0))
+                    .pb(px(40.0))
+                    .child(
+                        div()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .gap(px(gap))
+                            .child(left_col)
+                            .child(div().w(px(column)).flex_none().h_full().py(px(24.0)).child(lyrics)),
+                    )
+                    .into_any_element()
+            }
+            // Everything on one axis: the cover (or vinyl), the title, the sung line as a subtitle, controls.
             StageLayout::Center => {
                 let size = (area * 0.5).min(vw * 0.4).clamp(220.0, 600.0);
-                let cover = cover_frame.apply(self.cover_art(self.cover_large.clone(), size, (size * 0.035).max(10.0)).shadow_lg());
+                let cover = cover_frame.apply(self.stage_cover(size, (size * 0.035).max(10.0), window, cx));
                 // The subtitle reads from across the room: a size up from the card's.
                 let line = self.subtitle_line(&LyricStyle { text: 24.0, line_height: 32.0, ..subtitle }, window, cx);
                 let info = self.stage_info(&track, None, size.max(360.0), true, cx);
@@ -542,13 +906,17 @@ impl NabyTune {
                     .child(info)
                     .into_any_element()
             }
-            // The cover is the room: a big title bottom-left, the lyrics up the right.
+            // The cover is the room: a big title bottom-left (with floating vinyl when Vinyl mode is on), the lyrics up the right.
             StageLayout::Bleed => {
                 let title = (vh * 0.065).clamp(34.0, 76.0);
                 let seek = self.seek_line("stage-seek", self.stage_seek.clone(), (vw * 0.28).clamp(260.0, 520.0), cx);
                 let transport = self.transport(true, cx);
                 let lyrics_width = vw * 0.42 - RAIL_ROOM * 0.5;
                 let lyrics = self.lyric_column(&lyric_style((vh * 0.032).min(lyrics_width * 0.06).clamp(20.0, 40.0), 0.45), window, cx);
+                let bleed_vinyl = self.vinyl_mode.then(|| {
+                    let vsize = (area * 0.42).min(vw * 0.24).clamp(180.0, 340.0);
+                    cover_frame.apply(self.vinyl_disc(vsize, window, cx))
+                });
                 div()
                     .size_full()
                     .flex()
@@ -564,10 +932,9 @@ impl NabyTune {
                             .flex()
                             .flex_col()
                             .justify_end()
-                            // Title, seek line and buttons as one centred block: a left-hung
-                            // title over a centred row of buttons read as two things.
                             .items_center()
                             .gap_3()
+                            .children(bleed_vinyl.map(|v| div().pb_3().child(v)))
                             .child(
                                 div()
                                     .text_center()
@@ -590,6 +957,11 @@ impl NabyTune {
                 let lyrics = self.lyric_column(&lyric_style((vh * 0.054).min(lyrics_width * 0.06).clamp(24.0, 66.0), 0.45), window, cx);
                 let seek = self.seek_line("stage-seek", self.stage_seek.clone(), (vw * 0.26).clamp(240.0, 480.0), cx);
                 let transport = self.transport(true, cx);
+                let mini_cover: AnyElement = if self.vinyl_mode {
+                    self.vinyl_disc(56.0, window, cx).into_any_element()
+                } else {
+                    self.cover_art(self.cover.clone(), 56.0, 10.0).shadow_md().into_any_element()
+                };
                 div()
                     .size_full()
                     .flex()
@@ -615,7 +987,7 @@ impl NabyTune {
                                     .flex()
                                     .items_center()
                                     .gap_3()
-                                    .child(self.cover_art(self.cover.clone(), 56.0, 10.0).shadow_md())
+                                    .child(mini_cover)
                                     .child(
                                         div()
                                             .min_w_0()
@@ -630,10 +1002,10 @@ impl NabyTune {
                     )
                     .into_any_element()
             }
-            // A glass card floating in the middle: cover, the sung line, controls.
+            // A glass card floating in the middle: cover (or vinyl), the sung line, controls.
             StageLayout::Card => {
                 let size = (area * 0.5).min(vw * 0.3).clamp(300.0, 420.0);
-                let cover = cover_frame.apply(self.cover_art(self.cover_large.clone(), size, 14.0).shadow_md());
+                let cover = cover_frame.apply(self.stage_cover(size, 14.0, window, cx));
                 let line = self.subtitle_line(&LyricStyle { text: 16.0, ..subtitle }, window, cx);
                 let info = self.stage_info(&track, None, size, true, cx);
                 div()
@@ -715,6 +1087,8 @@ impl NabyTune {
         let mut card = div()
             .id("layout-menu")
             .w(px(220.0))
+            .max_h(px(640.0))
+            .overflow_y_scroll()
             .p(px(6.0))
             .flex()
             .flex_col()
@@ -763,6 +1137,168 @@ impl NabyTune {
                 cx.notify();
             })));
         }
+        card = card
+            .child(div().my(px(4.0)).mx(px(6.0)).h(px(1.0)).bg(rgba(STROKE)))
+            .child(header(t("VINYL")))
+            .child(item(("layout-vinyl-mode", 0), t("Vinyl disc"), self.vinyl_mode).on_click(cx.listener(|this, _, _, cx| {
+                this.vinyl_mode = !this.vinyl_mode;
+                settings::set("vinyl_mode", if this.vinyl_mode { "1" } else { "0" });
+                cx.notify();
+            })));
+        if self.vinyl_mode {
+            card = card
+                .child(item(("layout-vinyl-spin", 0), t("Rotate record"), self.vinyl_rotate).on_click(cx.listener(|this, _, _, cx| {
+                    this.vinyl_rotate = !this.vinyl_rotate;
+                    settings::set("vinyl_rotate", if this.vinyl_rotate { "1" } else { "0" });
+                    cx.notify();
+                })))
+                .child(header(t("ROTATION SPEED")))
+                .child(self.vinyl_speed_slider(208.0, cx));
+        }
         card
+    }
+
+    /// Interactive continuous slider for vinyl record spin speed (from fast 1.8s 33⅓ RPM to very slow 45s).
+    pub(crate) fn vinyl_speed_slider(&self, width: f32, cx: &mut Context<Self>) -> gpui::Div {
+        let bar = self.vinyl_speed_bar.clone();
+        let (measure, cell, cell_drag) = (bar.clone(), bar.clone(), bar);
+        let min_spd = 1.8f32;
+        let max_spd = 45.0f32;
+        let current = self.vinyl_speed.clamp(min_spd, max_spd);
+        let progress = ((current - min_spd) / (max_spd - min_spd)).clamp(0.0, 1.0);
+        let slider_w = (width - 12.0).max(80.0);
+
+        let desc = if current <= 2.5 {
+            "33⅓ RPM"
+        } else if current <= 5.5 {
+            "Cepat"
+        } else if current <= 12.0 {
+            "Sedang"
+        } else if current <= 24.0 {
+            "Lambat"
+        } else {
+            "Sangat Lambat"
+        };
+
+        let presets: [(f32, &'static str); 4] = [
+            (1.8, "33⅓"),
+            (8.0, "Sedang"),
+            (20.0, "Lambat"),
+            (35.0, "Santai"),
+        ];
+
+        let mut preset_row = div().flex().items_center().gap_1().w_full().pt_1();
+        for (spd, lbl) in presets {
+            let active = (self.vinyl_speed - spd).abs() < 1.0;
+            preset_row = preset_row.child(
+                div()
+                    .id(("vspeed-preset", (spd * 10.0) as usize))
+                    .flex_1()
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .text_size(px(10.5))
+                    .font_weight(if active { FontWeight::BOLD } else { FontWeight::NORMAL })
+                    .text_color(if active { rgb(0xffffff) } else { rgba(0xffffffaa) })
+                    .bg(if active { rgba(0xffffff28) } else { rgba(SUBTLE) })
+                    .hover(|s| s.bg(rgba(SUBTLE_STRONG)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.vinyl_speed = spd;
+                        settings::set("vinyl_speed", &spd.to_string());
+                        cx.notify();
+                    }))
+                    .child(lbl),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w(px(width))
+            .px(px(6.0))
+            .py(px(4.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(11.5))
+                    .child(div().font_weight(FontWeight::MEDIUM).text_color(rgb(0xffffff)).child(format!("{:.1} s", current)))
+                    .child(div().text_size(px(10.5)).text_color(rgba(SECONDARY)).child(desc)),
+            )
+            .child(
+                div()
+                    .on_children_prepainted(move |bounds, _, _| {
+                        if let Some(b) = bounds.first() {
+                            measure.set((f32::from(b.origin.x), f32::from(b.size.width)));
+                        }
+                    })
+                    .child(
+                        div()
+                            .id("vinyl-speed-bar")
+                            .w(px(slider_w))
+                            .h(px(20.0))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                    let (left, w) = cell.get();
+                                    let frac = ((f32::from(event.position.x) - left) / w.max(1.0)).clamp(0.0, 1.0);
+                                    let spd = ((min_spd + frac * (max_spd - min_spd)) * 2.0).round() / 2.0;
+                                    let spd = spd.clamp(min_spd, max_spd);
+                                    this.vinyl_speed = spd;
+                                    settings::set("vinyl_speed", &spd.to_string());
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                if event.pressed_button == Some(gpui::MouseButton::Left) {
+                                    let (left, w) = cell_drag.get();
+                                    let frac = ((f32::from(event.position.x) - left) / w.max(1.0)).clamp(0.0, 1.0);
+                                    let spd = ((min_spd + frac * (max_spd - min_spd)) * 2.0).round() / 2.0;
+                                    let spd = spd.clamp(min_spd, max_spd);
+                                    this.vinyl_speed = spd;
+                                    settings::set("vinyl_speed", &spd.to_string());
+                                    cx.notify();
+                                }
+                            }))
+                            .on_scroll_wheel(cx.listener(move |this, event: &gpui::ScrollWheelEvent, _, cx| {
+                                let dy = f32::from(event.delta.pixel_delta(px(20.0)).y);
+                                if dy != 0.0 {
+                                    let step = if dy > 0.0 { 1.0 } else { -1.0 };
+                                    let spd = (this.vinyl_speed + step).clamp(min_spd, max_spd);
+                                    this.vinyl_speed = spd;
+                                    settings::set("vinyl_speed", &spd.to_string());
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .h(px(5.0))
+                                    .rounded_full()
+                                    .bg(rgba(SUBTLE_STRONG))
+                                    .child(div().h_full().rounded_full().bg(rgb(accent())).w(px(slider_w * progress)))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top(px(-4.5))
+                                            .left(px((slider_w * progress - 7.0).clamp(-2.0, slider_w - 12.0)))
+                                            .size(px(14.0))
+                                            .rounded_full()
+                                            .bg(rgb(0xffffff))
+                                            .shadow_md(),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(preset_row)
     }
 }

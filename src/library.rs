@@ -116,11 +116,20 @@ impl Saved {
     fn from_json(v: &Value) -> Option<Self> {
         let text = |k: &str| v[k].as_str().unwrap_or("").to_string();
         let video_id = v["videoId"].as_str().filter(|s| !s.is_empty())?.to_string();
+        let artist = crate::youtube::clean_artist(&text("artist"));
+        let raw_detail = text("detail");
+        let detail = if raw_detail.contains(" • ") {
+            let parts: Vec<&str> = raw_detail.split(" • ").collect();
+            let album = parts.get(1).unwrap_or(&"");
+            if album.is_empty() { artist.clone() } else { format!("{} • {}", artist, album) }
+        } else {
+            artist.clone()
+        };
         Some(Self {
             video_id,
             title: text("title"),
-            artist: text("artist"),
-            detail: text("detail"),
+            artist,
+            detail,
             duration: text("duration"),
             thumbnail: v["thumbnail"].as_str().map(str::to_string),
         })

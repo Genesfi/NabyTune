@@ -59,6 +59,12 @@ impl NabyTune {
         // Never Home's (it's the page everything starts from, all its shelves drawn at once,
         // and its covers aren't fetched again) or the playing song's.
         let mut keep: HashSet<String> = HashSet::new();
+        for track in &self.home.tracks {
+            keep.insert(track.video_id.clone());
+        }
+        for track in &self.queue {
+            keep.insert(track.video_id.clone());
+        }
         if let Feed::Ready(shelves) = &self.feed {
             for shelf in shelves {
                 keep.extend(shelf.cards.iter().map(card_key));
@@ -158,7 +164,7 @@ impl NabyTune {
             let track = Track::from(youtube::SearchItem {
                 video_id: video_id.clone(),
                 title: card.title.clone(),
-                artist: card.subtitle.clone(),
+                artist: youtube::clean_artist(&card.subtitle),
                 album: String::new(),
                 duration: String::new(),
                 thumbnail: card.thumbnail.clone(),
@@ -498,41 +504,69 @@ impl NabyTune {
             )
             .when(!track.duration.is_empty(), |d| d.child(div().text_size(px(12.0)).text_color(rgba(TERTIARY)).child(track.duration.clone())))
             .child({
-                // On hover: + adds the song to a playlist; in a playlist, × takes it out.
+                // On hover: quick Play Next, Add to Queue, and + (add to playlist) / × (remove from playlist).
                 let group: SharedString = format!("row-{}-{i}", source.key()).into();
                 let in_playlist = match source {
                     Source::Playlist(p) => Some(p),
                     _ => None,
                 };
-                let t = track.clone();
+                let (t_next, t_queue, t_pl) = (track.clone(), track.clone(), track.clone());
+                let row_btn = |id: gpui::ElementId, glyph: &'static str| {
+                    div()
+                        .id(id)
+                        .size(px(26.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .font_family(ICONS)
+                        .text_size(px(12.0))
+                        .text_color(rgba(SECONDARY))
+                        .hover(|s| s.bg(rgba(SUBTLE_STRONG)).text_color(rgb(0xffffff)))
+                        .child(glyph)
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                };
                 div()
-                    .id(gpui::ElementId::NamedInteger(format!("row-act-{}", source.key()).into(), i as u64))
-                    .size(px(28.0))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .rounded(px(6.0))
-                    .font_family(ICONS)
-                    .text_size(px(12.0))
-                    .text_color(rgba(SECONDARY))
+                    .gap(px(2.0))
                     .opacity(0.0)
                     .group_hover(group, |s| s.opacity(1.0))
-                    .hover(|s| s.bg(rgba(SUBTLE_STRONG)).text_color(rgb(0xffffff)))
-                    .child(if in_playlist.is_some() { "\u{E711}" } else { "\u{E710}" })
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        match in_playlist {
-                            Some(p) => {
-                                if let Some(list) = this.library.playlists.get_mut(p) {
-                                    list.tracks.retain(|s| s.video_id != t.video_id);
-                                    this.library.save();
+                    .child(
+                        row_btn(gpui::ElementId::NamedInteger(format!("row-next-{}", source.key()).into(), i as u64), "\u{E7A7}").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.play_next(t_next.clone(), cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        row_btn(gpui::ElementId::NamedInteger(format!("row-queue-{}", source.key()).into(), i as u64), "\u{E8FD}").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.add_to_queue(t_queue.clone(), cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        row_btn(
+                            gpui::ElementId::NamedInteger(format!("row-act-{}", source.key()).into(), i as u64),
+                            if in_playlist.is_some() { "\u{E711}" } else { "\u{E710}" },
+                        )
+                        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            match in_playlist {
+                                Some(p) => {
+                                    if let Some(list) = this.library.playlists.get_mut(p) {
+                                        list.tracks.retain(|s| s.video_id != t_pl.video_id);
+                                        this.library.save();
+                                    }
                                 }
+                                None => this.open_playlist_menu(t_pl.clone(), event.position()),
                             }
-                            None => this.open_playlist_menu(t.clone(), event.position()),
-                        }
-                        cx.notify();
-                    }))
+                            cx.notify();
+                        })),
+                    )
             })
             .group(format!("row-{}-{i}", source.key()))
             .on_mouse_down(gpui::MouseButton::Right, {
@@ -591,7 +625,61 @@ impl NabyTune {
         for (i, track) in seeds.iter().enumerate() {
             let rise = self.rise(i);
             let Some(frame) = self.home.motion.get_mut(i).map(|state| state.frame(rise, window, cx)) else { continue };
+            let group: SharedString = format!("seed-card-{i}").into();
+            let (t_next, t_queue, t_menu, t_rc) = (track.clone(), track.clone(), track.clone(), track.clone());
+            let card_btn = |id: (&'static str, usize), glyph: &'static str| {
+                div()
+                    .id(id)
+                    .size(px(26.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .font_family(ICONS)
+                    .text_size(px(12.0))
+                    .text_color(rgb(0xffffff))
+                    .hover(|s| s.bg(rgba(0xffffff33)))
+                    .child(glyph)
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            };
+            let overlay = div()
+                .absolute()
+                .top(px(130.0))
+                .right(px(6.0))
+                .px(px(4.0))
+                .py(px(3.0))
+                .rounded_full()
+                .bg(rgba(0x1414_14cc))
+                .backdrop_blur(px(16.0))
+                .border_1()
+                .border_color(rgba(0xffffff22))
+                .shadow_md()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .opacity(0.0)
+                .group_hover(group.clone(), |s| s.opacity(1.0))
+                .child(card_btn(("seed-next", i), "\u{E7A7}").on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.play_next(t_next.clone(), cx);
+                })))
+                .child(card_btn(("seed-queue", i), "\u{E8FD}").on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.add_to_queue(t_queue.clone(), cx);
+                })))
+                .child(card_btn(("seed-more", i), "\u{E712}").on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.open_track_menu(t_menu.clone(), event.position(), None);
+                    cx.notify();
+                })));
             let card = Self::card(("seed", i).into(), art(self, &track.video_id), track.title.clone(), track.artist.clone(), current.as_deref() == Some(track.video_id.as_str()))
+                .relative()
+                .group(group)
+                .child(overlay)
+                .on_mouse_down(gpui::MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.open_track_menu(t_rc.clone(), event.position, None);
+                    cx.notify();
+                }))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.shelf_dragged {
                         return;
@@ -603,6 +691,24 @@ impl NabyTune {
         }
         let again = (!again.is_empty()).then(|| self.shelf("listen-again".into(), Self::heading(t("Played lately"), 20.0), again, window, cx));
 
+        let reload_btn = action("home-reload", "\u{E72C}", false).on_click(cx.listener(|this, _, _, cx| {
+            let recent: Vec<Track> = this.library.history.iter().take(8).map(Track::from).collect();
+            for track in &recent {
+                this.fetch_art(track, cx);
+            }
+            this.home = Listing::new(recent);
+            this.load_feed(cx);
+            cx.notify();
+        }));
+
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .pr(px(8.0))
+            .child(Self::heading(t("Home"), 30.0))
+            .child(reload_btn);
+
         let mut page = div()
             .id("home")
             .size_full()
@@ -613,7 +719,7 @@ impl NabyTune {
             .flex()
             .flex_col()
             .gap_6()
-            .child(Self::heading(t("Home"), 30.0))
+            .child(header)
             // Nothing played yet (a fresh install): no empty shelf.
             .children(again);
 

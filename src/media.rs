@@ -39,11 +39,11 @@ impl Media {
         self.events.try_iter().collect()
     }
 
-    pub fn track(&mut self, title: &str, artist: &str, cover_url: Option<&str>, length: Option<Duration>) {
+    pub fn track(&mut self, title: &str, artist: &str, album: Option<&str>, cover_url: Option<&str>, length: Option<Duration>) {
         let _ = self.controls.set_metadata(MediaMetadata {
             title: Some(title),
             artist: Some(artist),
-            album: None,
+            album,
             cover_url,
             duration: length,
         });

@@ -25,8 +25,8 @@ type Pick<T> = fn(&mut NabyTune, T, &mut Window, &mut Context<NabyTune>);
 /// Settings › Playback › Crossfade: (seconds, label).
 const CROSSFADES: [(u32, &str); 6] = [(0, "Off"), (2, "2 s"), (4, "4 s"), (6, "6 s"), (8, "8 s"), (12, "12 s")];
 
-const SOURCES: [(&str, &str); 5] =
-    [("", "Best available"), ("LyricsPlus", "LyricsPlus"), ("LRCLIB", "LRCLIB"), ("KuGou", "KuGou"), ("YouTube Music", "YouTube Music")];
+const SOURCES: [(&str, &str); 6] =
+    [("", "Best available"), ("LyricsPlus", "LyricsPlus"), ("LRCLIB", "LRCLIB"), ("KuGou", "KuGou"), ("NetEase", "NetEase"), ("YouTube Music", "YouTube Music")];
 
 const SLEEP_CHOICES: [(Sleep, &str); 7] = [
     (Sleep::Off, "Off"),
@@ -601,6 +601,29 @@ impl NabyTune {
                         cx.notify();
                     })),
                 ),
+                row(
+                    "Vinyl disc",
+                    t("Show album art as a vinyl record across full-screen layouts"),
+                    switch("vinyl-mode", self.vinyl_mode).on_click(cx.listener(|this, _, _, cx| {
+                        this.vinyl_mode = !this.vinyl_mode;
+                        settings::set("vinyl_mode", if this.vinyl_mode { "1" } else { "0" });
+                        cx.notify();
+                    })),
+                ),
+                row(
+                    "Vinyl rotation",
+                    t("Spin the vinyl record and album art while playing"),
+                    switch("vinyl-rotate", self.vinyl_rotate).on_click(cx.listener(|this, _, _, cx| {
+                        this.vinyl_rotate = !this.vinyl_rotate;
+                        settings::set("vinyl_rotate", if this.vinyl_rotate { "1" } else { "0" });
+                        cx.notify();
+                    })),
+                ),
+                row(
+                    "Vinyl spin speed",
+                    t("How fast the vinyl disc and album art rotate"),
+                    self.vinyl_speed_slider(260.0, cx),
+                ),
                 // Each language named in itself, so either can be found from the other.
                 row(
                     "Language",
@@ -645,11 +668,9 @@ impl NabyTune {
                 ),
                 row(
                     "Autoplay",
-                    t("When the queue's last song starts, songs like it line up after it"),
+                    t("Keep playing songs with similar vibes when the queue runs low"),
                     switch("autoplay", self.autoplay).on_click(cx.listener(|this, _, _, cx| {
-                        this.autoplay = !this.autoplay;
-                        settings::set("autoplay", if this.autoplay { "1" } else { "0" });
-                        cx.notify();
+                        this.toggle_autoplay(cx);
                     })),
                 ),
                 row(

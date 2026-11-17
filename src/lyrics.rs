@@ -103,13 +103,14 @@ pub(crate) fn clean(s: &str) -> String {
     let mut depth = 0;
     for c in s.chars() {
         match c {
-            '(' | '[' | '（' | '【' => depth += 1,
-            ')' | ']' | '）' | '】' => depth = (depth - 1).max(0),
+            '(' | '[' | '{' | '（' | '【' | '『' | '「' | '〔' | '〈' | '《' => depth += 1,
+            ')' | ']' | '}' | '）' | '】' | '』' | '」' | '〕' | '〉' | '》' => depth = (depth - 1).max(0),
             _ if depth == 0 => out.push(c),
             _ => {}
         }
     }
-    let out = out.split(" | ").next().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = out.trim_matches(|c: char| c == '.' || c == '…' || c == ' ' || c == '-');
+    let out = trimmed.split(" | ").next().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ");
     if out.is_empty() { s.trim().to_string() } else { out }
 }
 
@@ -150,32 +151,64 @@ fn get_json(http: &reqwest::blocking::Client, url: &str, query: &[(&str, String)
 
 fn lrclib(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64) -> Option<Timed> {
     let t = Duration::from_secs(8);
+    let clean_a = crate::youtube::clean_artist(artist);
+    let clean_t = clean(title);
     // Anyone can upload to LRCLIB, so an entry is taken only if its timings hold up.
     let usable = |lrc: Option<&str>| lrc.filter(|s| !s.trim().is_empty()).map(parse_lrc).filter(|lines| timed(lines, secs));
-    let exact = get_json(http, "https://lrclib.net/api/get", &[("track_name", title.into()), ("artist_name", artist.into()), ("duration", secs.to_string())], t).ok()?;
-    if let Some(lines) = usable(exact["syncedLyrics"].as_str()) {
-        return Some((lines, seconds(&exact["duration"])));
+    if let Ok(exact) = get_json(http, "https://lrclib.net/api/get", &[("track_name", title.into()), ("artist_name", clean_a.clone()), ("duration", secs.to_string())], t) {
+        if let Some(lines) = usable(exact["syncedLyrics"].as_str()) {
+            return Some((lines, seconds(&exact["duration"])));
+        }
     }
-    // The closest-length hit with usable timings, within 10 s.
+    if clean_t != title {
+        if let Ok(exact) = get_json(http, "https://lrclib.net/api/get", &[("track_name", clean_t.clone()), ("artist_name", clean_a.clone()), ("duration", secs.to_string())], t) {
+            if let Some(lines) = usable(exact["syncedLyrics"].as_str()) {
+                return Some((lines, seconds(&exact["duration"])));
+            }
+        }
+    }
+    // The closest-length hit with usable timings, within 10 s, verifying track title.
+    let clean_lower = clean_t.to_lowercase();
     let pick = |hits: &Value| -> Option<Timed> {
-        let mut hits: Vec<(&Value, f64)> =
-            hits.as_array()?.iter().map(|h| (h, (h["duration"].as_f64().unwrap_or(0.0) - secs as f64).abs())).filter(|(_, off)| *off <= 10.0).collect();
+        let mut hits: Vec<(&Value, f64)> = hits
+            .as_array()?
+            .iter()
+            .filter(|h| {
+                let hit_t = h["trackName"].as_str().unwrap_or("").to_lowercase();
+                if hit_t.is_empty() || clean_lower.is_empty() {
+                    return false;
+                }
+                hit_t.contains(&clean_lower) || clean_lower.contains(&hit_t) || {
+                    let words: Vec<&str> = clean_lower.split_whitespace().collect();
+                    !words.is_empty() && words.iter().any(|w| w.len() >= 2 && hit_t.contains(w))
+                }
+            })
+            .map(|h| (h, (h["duration"].as_f64().unwrap_or(0.0) - secs as f64).abs()))
+            .filter(|(_, off)| *off <= 10.0)
+            .collect();
         hits.sort_by(|a, b| a.1.total_cmp(&b.1));
         hits.into_iter().find_map(|(h, _)| usable(h["syncedLyrics"].as_str()).map(|lines| (lines, seconds(&h["duration"]))))
     };
-    let hits = get_json(http, "https://lrclib.net/api/search", &[("track_name", title.into()), ("artist_name", artist.into())], t).ok()?;
-    if let Some(lines) = pick(&hits) {
-        return Some(lines);
+    if let Ok(hits) = get_json(http, "https://lrclib.net/api/search", &[("track_name", clean_t.clone()), ("artist_name", clean_a.clone())], t) {
+        if let Some(lines) = pick(&hits) {
+            return Some(lines);
+        }
     }
-    let hits = get_json(http, "https://lrclib.net/api/search", &[("q", format!("{title} {artist}"))], t).ok()?;
-    if let Some(lines) = pick(&hits) {
-        return Some(lines);
+    if let Ok(hits) = get_json(http, "https://lrclib.net/api/search", &[("q", format!("{clean_t} {clean_a}"))], t) {
+        if let Some(lines) = pick(&hits) {
+            return Some(lines);
+        }
     }
     // "好きでいて - Suki de Ite": YouTube's title carries the reading after a dash; LRCLIB's
     // carries the title alone.
-    let (short, _) = title.split_once(" - ")?;
-    let hits = get_json(http, "https://lrclib.net/api/search", &[("track_name", short.trim().into()), ("artist_name", artist.into())], t).ok()?;
-    pick(&hits)
+    if let Some((short, _)) = title.split_once(" - ") {
+        if let Ok(hits) = get_json(http, "https://lrclib.net/api/search", &[("track_name", short.trim().into()), ("artist_name", clean_a.clone())], t) {
+            if let Some(lines) = pick(&hits) {
+                return Some(lines);
+            }
+        }
+    }
+    None
 }
 
 /// Syllables ("I've ", "been ", or "jus", "ti", "fy ") into words: a syllable ending in a
@@ -337,6 +370,61 @@ fn kugou(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64)
     Some((lines, candidate.2))
 }
 
+fn netease(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64) -> Option<Timed> {
+    let t = Duration::from_secs(6);
+    let clean_a = crate::youtube::clean_artist(artist);
+    let clean_t = clean(title);
+    let queries = [
+        format!("{clean_t} {clean_a}"),
+        format!("{title} {clean_a}"),
+        clean_t.clone(),
+    ];
+
+    for query in queries {
+        let search: Value = match http
+            .get("https://music.163.com/api/search/get/")
+            .query(&[("s", query.as_str()), ("type", "1"), ("limit", "4")])
+            .header("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .header("referer", "https://music.163.com")
+            .header("cookie", "os=pc")
+            .timeout(t)
+            .send()
+            .ok()
+            .and_then(|r| r.error_for_status().ok())
+            .and_then(|r| r.json().ok()) {
+                Some(v) => v,
+                None => continue,
+            };
+
+        let Some(songs) = search["result"]["songs"].as_array() else { continue };
+        for song in songs.iter().take(3) {
+            let Some(id) = song["id"].as_i64() else { continue };
+            let dur = song["duration"].as_f64().map(|ms| Duration::from_secs_f64(ms / 1000.0));
+            let lyric_resp: Value = match http
+                .get(format!("https://music.163.com/api/song/lyric?id={id}&lv=1&kv=1&tv=-1"))
+                .header("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                .header("referer", "https://music.163.com")
+                .header("cookie", "os=pc")
+                .timeout(t)
+                .send()
+                .ok()
+                .and_then(|r| r.error_for_status().ok())
+                .and_then(|r| r.json().ok()) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+            if let Some(lrc) = lyric_resp["lrc"]["lyric"].as_str() {
+                let lines = parse_lrc(lrc);
+                if timed(&lines, secs) {
+                    return Some((lines, dur));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Every source at once, BitChord's way: the answers are taken in priority order (a
 /// faster source lower down can't jump a slower one above it), and the first with timed
 /// lines wins; word-timed sources are the first ones asked. What else has answered by
@@ -345,11 +433,12 @@ pub fn fetch(http: &reqwest::blocking::Client, title: &str, artist: &str, length
     let (title, artist) = (clean(title), clean(artist));
     let secs = length.as_secs();
     type Ask = fn(&reqwest::blocking::Client, &str, &str, u64) -> Option<Timed>;
-    const ASK: [(&str, Ask); 8] = [
+    const ASK: [(&str, Ask); 9] = [
         ("lrc.red", crate::lyrics_sources::lrc_red),
         ("BiniLyrics", crate::lyrics_sources::bini_lyrics),
         ("BetterLyrics", |h, t, a, s| crate::lyrics_sources::better_lyrics(h, t, a, s, false)),
         ("BetterLyrics Portato", |h, t, a, s| crate::lyrics_sources::better_lyrics(h, t, a, s, true)),
+        ("NetEase", netease),
         ("LyricsPlus", lyricsplus),
         ("Unison", crate::lyrics_sources::unison),
         ("KuGou", kugou),
@@ -524,7 +613,7 @@ mod tests {
 // ---- Kept on disk ------------------------------------------------------------------------
 
 /// Every source a cached version can name (cached versions come back with these).
-const SOURCES: [&str; 9] = ["lrc.red", "BiniLyrics", "BetterLyrics", "BetterLyrics Portato", "LyricsPlus", "Unison", "LRCLIB", "KuGou", "YouTube Music"];
+const SOURCES: [&str; 10] = ["lrc.red", "BiniLyrics", "BetterLyrics", "BetterLyrics Portato", "LyricsPlus", "Unison", "KuGou", "NetEase", "LRCLIB", "YouTube Music"];
 
 /// How long found lyrics are kept before they're asked for again.
 const KEEP: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
@@ -542,12 +631,15 @@ fn ms(d: Duration) -> u64 {
 /// an empty list, so a song without lyrics isn't asked about every time).
 pub fn cached(video_id: &str) -> Option<Vec<Found>> {
     let path = cache_file(video_id)?;
-    let age = std::fs::metadata(&path).ok()?.modified().ok()?.elapsed().unwrap_or_default();
-    let keep = if std::fs::read_to_string(&path).ok()?.contains("\"versions\":[]") { KEEP / 10 } else { KEEP };
-    if age > keep {
+    let raw = std::fs::read_to_string(&path).ok()?;
+    if raw.contains("\"versions\":[]") {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    let age = std::fs::metadata(&path).ok()?.modified().ok()?.elapsed().unwrap_or_default();
+    if age > KEEP {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     // Kept before BitChord's sources were asked: found again.
     if v["format"].as_u64().unwrap_or(1) < 3 {
         return None;

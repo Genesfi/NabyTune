@@ -105,6 +105,26 @@ fn last_thumbnail(v: &Value) -> Option<String> {
     v["thumbnails"].as_array().and_then(|t| t.last()).and_then(|t| t["url"].as_str()).map(str::to_string)
 }
 
+pub const KINDS: [&str; 8] = ["Single", "Album", "EP", "Playlist", "Song", "Lagu", "Video", "Track"];
+
+/// Cleans an artist string from category prefixes (e.g. "Song • Aethoro", "Lagu • Aethoro"),
+/// view counts, or release years.
+pub fn clean_artist(raw: &str) -> String {
+    let parts: Vec<&str> = raw.split(" • ").collect();
+    let is_kind = |p: &&str| {
+        let trimmed = p.trim();
+        KINDS.iter().any(|k| trimmed.eq_ignore_ascii_case(k))
+            || ["views", "likes", "plays", "ditonton", "penayangan", "suka"].iter().any(|w| trimmed.to_lowercase().contains(w))
+            || (trimmed.len() == 4 && trimmed.chars().all(|c| c.is_ascii_digit()))
+    };
+    let filtered: Vec<&str> = parts.into_iter().filter(|p| !is_kind(p)).collect();
+    if let Some(first) = filtered.first() {
+        first.trim().to_string()
+    } else {
+        raw.trim().to_string()
+    }
+}
+
 /// A song row (`musicResponsiveListItemRenderer`): search results, quick picks, playlist
 /// and album tracks. `card` fills in what an album's own rows leave out.
 fn song(item: &Value, card: Option<&Card>) -> Option<SearchItem> {
@@ -123,14 +143,16 @@ fn song(item: &Value, card: Option<&Card>) -> Option<SearchItem> {
     }
     // "Artist • Album • 3:33"; an album's rows put the length in a fixed column instead.
     let is_clock = |p: &String| p.contains(':') && p.chars().all(|c| c.is_ascii_digit() || c == ':');
+    let is_kind = |p: &str| KINDS.iter().any(|k| p.eq_ignore_ascii_case(k));
     let parts: Vec<String> = column(1).split(" • ").filter(|p| !p.is_empty()).map(str::to_string).collect();
     let duration = parts
         .last()
         .filter(|p| is_clock(p))
         .cloned()
         .or_else(|| Some(runs(&item["fixedColumns"][0]["musicResponsiveListItemFixedColumnRenderer"]["text"])).filter(is_clock));
-    let named: Vec<&String> = parts.iter().filter(|p| !is_clock(p)).collect();
-    let artist = named.first().map(|s| s.to_string()).or_else(|| card.map(|c| card_artist(&c.subtitle))).unwrap_or_default();
+    let named: Vec<&String> = parts.iter().filter(|p| !is_clock(p) && !is_kind(p)).collect();
+    let raw_artist = named.first().map(|s| s.to_string()).or_else(|| card.map(|c| card_artist(&c.subtitle))).unwrap_or_default();
+    let artist = clean_artist(&raw_artist);
     Some(SearchItem {
         video_id,
         title,
@@ -145,12 +167,7 @@ fn song(item: &Value, card: Option<&Card>) -> Option<SearchItem> {
 /// The artist out of a card's subtitle ("Single • Nabila Maharani & Tri Suaka • 2026"):
 /// without the kind of release and the year.
 fn card_artist(subtitle: &str) -> String {
-    const KINDS: [&str; 7] = ["Single", "Album", "EP", "Playlist", "Song", "Lagu", "Video"];
-    subtitle
-        .split(" • ")
-        .filter(|part| !KINDS.contains(part) && !(part.len() == 4 && part.chars().all(|c| c.is_ascii_digit())))
-        .collect::<Vec<_>>()
-        .join(" • ")
+    clean_artist(subtitle)
 }
 
 /// One item of a shelf: a song row, or a card (`musicTwoRowItemRenderer`).
@@ -248,13 +265,15 @@ fn panel_track(item: &Value) -> Option<SearchItem> {
     let byline = runs(&p["longBylineText"]);
     let parts: Vec<&str> = byline.split(" • ").collect();
     let counted = |s: &&&str| [" views", " likes", " plays"].iter().any(|w| s.ends_with(w));
+    let is_kind = |p: &&str| KINDS.iter().any(|k| p.eq_ignore_ascii_case(k));
+    let named: Vec<&&str> = parts.iter().filter(|p| !counted(p) && !is_kind(p)).collect();
     Some(SearchItem {
         video_id: id.to_string(),
         title: runs(&p["title"]),
-        artist: parts.first().map(|s| s.to_string()).unwrap_or_default(),
-        album: parts
+        artist: clean_artist(named.first().map(|s| s.to_string()).unwrap_or_default().as_str()),
+        album: named
             .get(1)
-            .filter(|a| !a.chars().all(|c| c.is_ascii_digit()) && !counted(a))
+            .filter(|a| !a.chars().all(|c| c.is_ascii_digit()))
             .map(|s| s.to_string())
             .unwrap_or_default(),
         duration: runs(&p["lengthText"]),
