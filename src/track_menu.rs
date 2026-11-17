@@ -298,12 +298,42 @@ impl NabyTune {
                 this.close_track_menu();
                 this.playlist_menu = Some(PlaylistMenu { track: c.clone(), at });
                 cx.notify();
-            })));
+            })))
+            .child(separator());
         rows += 3.0;
+        separators += 1.0;
+
+        let is_local = crate::local::is_local(&track.video_id);
+        if !is_local {
+            let vid = track.video_id.clone();
+            card = card.child(item("tm-copy-link", "\u{E71B}", t("Copy link").into()).on_click(cx.listener(move |this, _, _, cx| {
+                this.close_track_menu();
+                let url = format!("https://music.youtube.com/watch?v={vid}");
+                this.copy_text(url, t("Copied YouTube Music link").into(), cx);
+            })));
+            rows += 1.0;
+        }
+        let title_str = track.title.to_string();
+        let artist_str = track.artist.to_string();
+        card = card
+            .child(item("tm-copy-title", "\u{E8C8}", t("Copy title").into()).on_click(cx.listener(move |this, _, _, cx| {
+                this.close_track_menu();
+                this.copy_text(title_str.clone(), tf("Copied: {}", &[&title_str]).into(), cx);
+            })))
+            .child(item("tm-copy-artist", "\u{E8C8}", t("Copy artist").into()).on_click(cx.listener(move |this, _, _, cx| {
+                this.close_track_menu();
+                this.copy_text(artist_str.clone(), tf("Copied: {}", &[&artist_str]).into(), cx);
+            })));
+        rows += 2.0;
+
         let height = 48.0 + (rows - 3.0) * 35.0 + separators * 9.0 + 14.0;
         let viewport = window.viewport_size();
         let x = f32::from(at.x).clamp(8.0, f32::from(viewport.width) - 248.0);
-        let y = if f32::from(at.y) + height > f32::from(viewport.height) - 8.0 { f32::from(at.y) - height } else { f32::from(at.y) };
+        let y = if f32::from(at.y) + height > f32::from(viewport.height) - 8.0 {
+            (f32::from(at.y) - height).max(8.0)
+        } else {
+            f32::from(at.y).min((f32::from(viewport.height) - height - 8.0).max(8.0))
+        };
         Some(deferred(div().absolute().left(px(x)).top(px(y.max(8.0))).child(card)).with_priority(3).into_any_element())
     }
 }

@@ -286,6 +286,53 @@ impl NabyTune {
             .child(div().flex().child(self.back_button(cx)))
     }
 
+    /// Copies text to the Windows clipboard and shows a brief confirmation toast.
+    pub(crate) fn copy_text(&mut self, text: String, label: SharedString, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.toast = Some((label, std::time::Instant::now()));
+        cx.notify();
+    }
+
+    /// Toggles YouTube Music subscription (Follow/Subscribe) for the currently viewed artist.
+    pub(crate) fn toggle_artist_subscribe(&mut self, channel_id: String, name: String, cx: &mut Context<Self>) {
+        if self.account.is_none() {
+            self.toast = Some((t("Sign in to YouTube Music to subscribe").into(), std::time::Instant::now()));
+            cx.notify();
+            return;
+        }
+        let Some(view) = self.artist_view.as_mut() else { return };
+        let Some(page) = view.page.as_mut() else { return };
+        let next = !page.subscribed;
+        page.subscribed = next;
+        let msg = if next {
+            tf("Subscribed to {}", &[&name])
+        } else {
+            tf("Unsubscribed from {}", &[&name])
+        };
+        self.toast = Some((msg.into(), std::time::Instant::now()));
+        cx.notify();
+
+        let youtube = self.youtube.clone();
+        let ch = channel_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { youtube.subscribe(&ch, next) }).await;
+            if let Err(e) = res {
+                let _ = this.update(cx, |app, cx| {
+                    if let Some(view) = app.artist_view.as_mut() {
+                        if let Some(page) = view.page.as_mut() {
+                            if page.channel_id.as_deref() == Some(channel_id.as_str()) {
+                                page.subscribed = !next;
+                            }
+                        }
+                    }
+                    app.toast = Some((tf("Couldn't update subscription: {}", &[&format!("{e:#}")]).into(), std::time::Instant::now()));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn artist_page(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> AnyElement {
         let mut page = self.sub_page("artist-page", cx);
         let Some(view) = self.artist_view.as_ref() else { return page.into_any_element() };
@@ -295,6 +342,13 @@ impl NabyTune {
             (None, None) => t("Loading…").into(),
             (None, Some(p)) => p.subtitle.clone().into(),
         };
+        let artist_name_copy = view.name.to_string();
+        let radio = view.page.as_ref().and_then(|p| p.radio.clone());
+        let channel_id = view.page.as_ref().and_then(|p| p.channel_id.clone());
+        let subscribed = view.page.as_ref().is_some_and(|p| p.subscribed);
+        let name_for_btns = view.name.clone();
+        let has_songs = !view.songs.is_empty();
+
         page = page.child(
             div()
                 .flex()
@@ -307,33 +361,119 @@ impl NabyTune {
                         .flex_col()
                         .gap_2()
                         .child(div().text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).text_color(rgba(TERTIARY)).child(t("ARTIST")))
-                        .child(div().font_family(DISPLAY).text_size(px(40.0)).font_weight(FontWeight::BOLD).child(view.name.clone()))
-                        .child(div().text_size(px(13.0)).text_color(rgba(SECONDARY)).child(subtitle))
-                        .when(!view.songs.is_empty(), |d| {
-                            let radio = view.page.as_ref().and_then(|p| p.radio.clone());
-                            let name = view.name.clone();
-                            d.child(div().pt_2().flex().gap_2().child(self.play_buttons("artist-play", Source::Artist, cx)).when_some(radio, |d, playlist| {
-                                d.child(
+                        .child(
+                            div()
+                                .id("artist-name-copy")
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .group("artist-title")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.copy_text(artist_name_copy.clone(), tf("Copied: {}", &[&artist_name_copy]).into(), cx);
+                                }))
+                                .child(div().font_family(DISPLAY).text_size(px(40.0)).font_weight(FontWeight::BOLD).child(view.name.clone()))
+                                .child(
                                     div()
-                                        .id("artist-radio")
-                                        .h(px(38.0))
-                                        .px(px(18.0))
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .rounded_full()
-                                        .cursor_pointer()
+                                        .font_family(ICONS)
                                         .text_size(px(14.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .bg(rgba(SUBTLE_STRONG))
-                                        .border_1()
-                                        .border_color(rgba(STROKE))
-                                        .hover(|s| s.bg(rgba(0xffffff26)))
-                                        .child(div().font_family(ICONS).text_size(px(12.0)).child("\u{EC05}"))
-                                        .child(t("Radio"))
-                                        .on_click(cx.listener(move |this, _, _, cx| this.start_artist_radio(playlist.clone(), name.clone(), cx))),
-                                )
-                            }))
+                                        .text_color(rgba(SECONDARY))
+                                        .opacity(0.0)
+                                        .group_hover("artist-title", |s| s.opacity(0.9))
+                                        .child("\u{E8C8}"),
+                                ),
+                        )
+                        .child(div().text_size(px(13.0)).text_color(rgba(SECONDARY)).child(subtitle))
+                        .when(has_songs || channel_id.is_some(), |d| {
+                            let name_r = name_for_btns.clone();
+                            let name_s = name_for_btns.to_string();
+                            let ch_sub = channel_id.clone();
+                            let ch_link = channel_id.clone();
+                            d.child(
+                                div()
+                                    .pt_2()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_2()
+                                    .when(has_songs, |d| d.child(self.play_buttons("artist-play", Source::Artist, cx)))
+                                    .when_some(radio, |d, playlist| {
+                                        d.child(
+                                            div()
+                                                .id("artist-radio")
+                                                .h(px(38.0))
+                                                .px(px(18.0))
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .rounded_full()
+                                                .cursor_pointer()
+                                                .text_size(px(14.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .bg(rgba(SUBTLE_STRONG))
+                                                .border_1()
+                                                .border_color(rgba(STROKE))
+                                                .hover(|s| s.bg(rgba(0xffffff26)))
+                                                .child(div().font_family(ICONS).text_size(px(12.0)).child("\u{EC05}"))
+                                                .child(t("Radio"))
+                                                .on_click(cx.listener(move |this, _, _, cx| this.start_artist_radio(playlist.clone(), name_r.clone(), cx))),
+                                        )
+                                    })
+                                    .when_some(ch_sub, |d, ch| {
+                                        d.child(
+                                            div()
+                                                .id("artist-subscribe")
+                                                .h(px(38.0))
+                                                .px(px(18.0))
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .rounded_full()
+                                                .cursor_pointer()
+                                                .text_size(px(14.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .bg(if subscribed { rgba(0xffffff1a) } else { rgba(SUBTLE_STRONG) })
+                                                .border_1()
+                                                .border_color(if subscribed { rgb(accent()) } else { rgba(STROKE) })
+                                                .text_color(if subscribed { rgb(0xffffff) } else { rgba(0xffffffdd) })
+                                                .hover(|s| s.bg(rgba(0xffffff26)))
+                                                .child(
+                                                    div()
+                                                        .font_family(ICONS)
+                                                        .text_size(px(12.0))
+                                                        .when(subscribed, |d| d.text_color(rgb(accent())))
+                                                        .child(if subscribed { "\u{E73E}" } else { "\u{E710}" }),
+                                                )
+                                                .child(if subscribed { t("Subscribed") } else { t("Subscribe") })
+                                                .on_click(cx.listener(move |this, _, _, cx| this.toggle_artist_subscribe(ch.clone(), name_s.clone(), cx))),
+                                        )
+                                    })
+                                    .when_some(ch_link, |d, ch| {
+                                        d.child(
+                                            div()
+                                                .id("artist-copy-link")
+                                                .h(px(38.0))
+                                                .px(px(16.0))
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .rounded_full()
+                                                .cursor_pointer()
+                                                .text_size(px(14.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .bg(rgba(SUBTLE_STRONG))
+                                                .border_1()
+                                                .border_color(rgba(STROKE))
+                                                .hover(|s| s.bg(rgba(0xffffff26)))
+                                                .child(div().font_family(ICONS).text_size(px(12.0)).child("\u{E71B}"))
+                                                .child(t("Share"))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    let url = format!("https://music.youtube.com/channel/{ch}");
+                                                    this.copy_text(url, t("Copied artist link").into(), cx);
+                                                })),
+                                        )
+                                    }),
+                            )
                         }),
                 ),
         );

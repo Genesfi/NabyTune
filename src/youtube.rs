@@ -225,6 +225,10 @@ pub struct ArtistPage {
     /// The playlist id of the header's "Shuffle" button ("RDAO…"): their own songs, shuffled,
     /// endless like a radio.
     pub shuffle: Option<String>,
+    /// Channel ID (`UC…`) for subscribing and building a YouTube Music share link.
+    pub channel_id: Option<String>,
+    /// Whether the signed-in YouTube Music account currently subscribes to this artist.
+    pub subscribed: bool,
 }
 
 /// One of the chips over a radio's queue ("All", "Popular", "Discover", "Deep cuts", a mood,
@@ -778,6 +782,13 @@ impl YouTube {
         Ok(())
     }
 
+    /// Subscribes to or unsubscribes from an artist channel on YouTube Music (signed in).
+    pub fn subscribe(&self, channel_id: &str, subscribed: bool) -> Result<()> {
+        let endpoint = if subscribed { "subscription/subscribe" } else { "subscription/unsubscribe" };
+        self.music(endpoint, json!({ "channelIds": [channel_id] }))?;
+        Ok(())
+    }
+
     /// The account's liked songs, all of them.
     pub fn liked_songs(&self) -> Result<Vec<SearchItem>> {
         let card = Card { title: "Liked music".into(), subtitle: String::new(), thumbnail: None, browse_id: Some("VLLM".into()), video_id: None };
@@ -847,17 +858,23 @@ impl YouTube {
             .find(|h| h.is_object())
             .cloned()
             .unwrap_or(Value::Null);
+        let sub_btn = &header["subscriptionButton"]["subscribeButtonRenderer"];
         let mut out = ArtistPage {
             name: runs(&header["title"]),
-            subtitle: runs(&header["subscriptionButton"]["subscribeButtonRenderer"]["longSubscriberCountText"])
+            subtitle: runs(&sub_btn["longSubscriberCountText"])
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" "),
             thumbnail: last_thumbnail(&header["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]),
+            channel_id: sub_btn["channelId"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| browse_id.starts_with("UC").then(|| browse_id.to_string())),
+            subscribed: sub_btn["subscribed"].as_bool().unwrap_or(false),
             ..Default::default()
         };
         if out.subtitle.is_empty() {
-            out.subtitle = runs(&header["subscriptionButton"]["subscribeButtonRenderer"]["subscriberCountText"]);
+            out.subtitle = runs(&sub_btn["subscriberCountText"]);
         }
         // "Mix" (startRadioButton, RDEM…) and "Shuffle" (playButton, RDAO…); failing those,
         // any watch link in the header with the same kind of id.
