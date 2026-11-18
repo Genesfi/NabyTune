@@ -93,6 +93,39 @@ impl NabyTune {
         // Between groups: a dot, not a rule.
         let dot = || div().my(px(3.0)).size(px(3.0)).rounded_full().bg(rgba(0xffffff33));
 
+        let queue = button(
+            "rail-queue",
+            if self.stage_queue { "Show lyrics" } else { "Up Next" },
+            glyph("\u{E8FD}", 14.0),
+            toggled(self.stage_queue),
+            false,
+            Box::new(cx.listener(|this, _, _, cx| {
+                this.stage_queue = !this.stage_queue;
+                if !this.stage_queue {
+                    this.lyric_motion.scroll = MotionState::default();
+                }
+                cx.notify();
+            })),
+        );
+        let karaoke_on = !self.stage_queue && self.look == Look::Karaoke;
+        let karaoke = button(
+            "rail-karaoke",
+            "Karaoke",
+            glyph("\u{E720}", 14.0),
+            toggled(karaoke_on),
+            false,
+            Box::new(cx.listener(|this, _, _, cx| {
+                if !this.stage_queue && this.look == Look::Karaoke {
+                    this.look = Look::Focus;
+                } else {
+                    this.look = Look::Karaoke;
+                    this.stage_queue = false;
+                }
+                settings::set("lyric_look", this.look.key());
+                this.lyric_motion.scroll = MotionState::default();
+                cx.notify();
+            })),
+        );
         let layout = button(
             "rail-layout",
             "Layout & background",
@@ -121,7 +154,17 @@ impl NabyTune {
                 cx.notify();
             })),
         );
-        let mut rail = div().flex().flex_col().items_center().gap(px(6.0)).child(self.stage_volume(cx)).child(dot()).child(layout).child(look);
+        let mut rail = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(6.0))
+            .child(self.stage_volume(cx))
+            .child(dot())
+            .child(queue)
+            .child(karaoke)
+            .child(layout)
+            .child(look);
 
         if matches!(self.lyrics, Lyrics::Ready(_)) {
             let romaji = button(
@@ -679,6 +722,231 @@ impl NabyTune {
         Some(container)
     }
 
+    /// Full-height scrollable queue / playlist panel for the Full-Screen stage (ytm-rs style),
+    /// showing previous songs, the currently playing track highlighted, and upcoming songs.
+    pub(crate) fn stage_queue_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(cur) = self.index else {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(14.0))
+                .text_color(rgba(SECONDARY))
+                .child(t("Queue is empty"))
+                .into_any_element();
+        };
+
+        let autoplay_on = self.autoplay;
+        let loop_locked = self.repeat != Repeat::Off;
+        let autoplay_active = autoplay_on && !loop_locked;
+
+        let autoplay_btn = div()
+            .id("stage-queue-autoplay")
+            .h(px(28.0))
+            .px(px(10.0))
+            .rounded_full()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .border_1()
+            .border_color(if autoplay_active { rgb(accent()) } else { rgba(0xffffff1f) })
+            .bg(if autoplay_active { rgba(0xffffff1a) } else { rgba(0xffffff0a) })
+            .when(autoplay_on && loop_locked, |d| d.opacity(0.6))
+            .hover(|s| s.bg(rgba(0xffffff22)))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_autoplay(cx)))
+            .child(
+                div()
+                    .size(px(14.0))
+                    .rounded(px(4.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if autoplay_active { rgb(accent()) } else { rgba(0xffffff18) })
+                    .font_family(ICONS)
+                    .text_size(px(9.0))
+                    .text_color(if autoplay_active { rgb(on_accent()) } else { rgba(0xffffff66) })
+                    .child(if autoplay_on { "\u{E73E}" } else { "" }),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if autoplay_active { rgb(0xffffff) } else { rgba(0xffffffb3) })
+                    .child(if autoplay_on && loop_locked {
+                        "Autoplay paused (Loop active)"
+                    } else {
+                        "Autoplay similar songs"
+                    }),
+            );
+
+        let header = div()
+            .flex_none()
+            .pb_3()
+            .px_2()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(autoplay_btn)
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgba(0xffffff80))
+                    .child(format!("{} / {}", cur + 1, self.queue.len())),
+            );
+
+        let mut list = div()
+            .id("stage-queue-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .pr_2()
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+
+        let queue = self.queue.clone();
+        for (j, track) in queue.iter().enumerate() {
+            let here = j == cur;
+            let played = j < cur;
+            let art = self.art.get(&track.video_id).map(|a| a.small.clone());
+            list = list.child(
+                div()
+                    .id(("stage-q", j))
+                    .group(format!("stage-q-{j}"))
+                    .h(px(56.0))
+                    .flex_none()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .rounded(px(10.0))
+                    .cursor_pointer()
+                    .when(here, |d| {
+                        d.bg(rgba(0xffffff1c))
+                            .border_1()
+                            .border_color(rgba(0xffffff1f))
+                    })
+                    .when(played, |d| d.opacity(0.62).hover(|s| s.opacity(1.0).bg(rgba(0xffffff12))))
+                    .when(!here && !played, |d| d.hover(|s| s.bg(rgba(0xffffff12))))
+                    .child(
+                        div()
+                            .relative()
+                            .size(px(40.0))
+                            .flex_none()
+                            .child(artwork(art, 40.0, 6.0))
+                            .when(here, |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .rounded(px(6.0))
+                                        .bg(rgba(0x0000_0066))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .font_family(ICONS)
+                                        .text_size(px(14.0))
+                                        .text_color(rgb(0xffffff))
+                                        .child(if self.playing { "\u{E768}" } else { "\u{E769}" }),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .truncate()
+                                    .text_color(if here { rgb(accent()) } else { rgb(0xffffff) })
+                                    .child(track.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgba(0xffffff99))
+                                    .truncate()
+                                    .child(track.artist.clone()),
+                            ),
+                    )
+                    .when(!track.duration.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.0))
+                                .text_color(rgba(0xffffff73))
+                                .child(track.duration.clone()),
+                        )
+                    })
+                    .when(!here, |d| {
+                        d.child(
+                            div()
+                                .id(("stage-q-rem", j))
+                                .size(px(26.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.0))
+                                .font_family(ICONS)
+                                .text_size(px(11.0))
+                                .text_color(rgba(0xffffff99))
+                                .opacity(0.0)
+                                .group_hover(format!("stage-q-{j}"), |s| s.opacity(1.0))
+                                .hover(|s| s.bg(rgba(0xffffff22)).text_color(rgb(0xffffff)))
+                                .child("\u{E711}")
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.remove_from_queue(j, cx);
+                                })),
+                        )
+                    })
+                    .on_mouse_down(gpui::MouseButton::Right, {
+                        let t = track.clone();
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            this.open_track_menu(t.clone(), event.position, Some(j));
+                            cx.notify();
+                        })
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.index = Some(j);
+                        this.playing = true;
+                        this.start(cx);
+                    })),
+            );
+        }
+
+        if self.autoplay_fetching.is_some() {
+            list = list.child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.0))
+                    .text_color(rgba(0xffffff88))
+                    .child(div().size(px(6.0)).rounded_full().bg(rgb(accent())))
+                    .child(t("Finding similar vibes…")),
+            );
+        }
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(list)
+            .into_any_element()
+    }
+
     /// The whole window for the song, in the chosen layout over the chosen background.
     /// Every size follows the window, so a maximised window fills out rather than leaving
     /// a small player in one corner.
@@ -809,8 +1077,45 @@ impl NabyTune {
         };
         let subtitle = LyricStyle { text: 19.0, line_height: 26.0, gap: 0.0, pad: 0.0, anchor: 0.5, blur_step: 0.0, blur_max: 0.0 };
 
-        let body: AnyElement = match layout {
-            // Cover (or spinning vinyl) and controls beside the lyrics, the pair centred as one group.
+        let body: AnyElement = if self.stage_queue && matches!(layout, StageLayout::Center | StageLayout::Lyrics | StageLayout::Card) {
+            // When Playlist/Queue is toggled on from Center/Lyrics/Card layouts, show the clean
+            // ytm-rs side-by-side layout: spinning vinyl/cover on the left, full playlist on the right.
+            let size = (area * 0.62).min(vw * 0.3).clamp(240.0, 560.0);
+            let gap = (vw * 0.05).clamp(40.0, 110.0);
+            let room = ((vw - 64.0 - 64.0 - RAIL_ROOM).min(1500.0) - size - gap).max(240.0);
+            let column = room.min(size * 1.45).min(860.0);
+            let cover = cover_frame.apply(self.stage_cover(size, (size * 0.035).max(10.0), window, cx));
+            let info = self.stage_info(&track, None, size, true, cx);
+            let queue_view = self.stage_queue_panel(cx);
+            let left_col = div()
+                .w(px(size))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_4()
+                .child(cover)
+                .child(info);
+            div()
+                .size_full()
+                .flex()
+                .justify_center()
+                .pl(px(64.0))
+                .pr(px(64.0 + RAIL_ROOM - 40.0))
+                .pb(px(40.0))
+                .child(
+                    div()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(gap))
+                        .child(left_col)
+                        .child(div().w(px(column)).flex_none().h_full().py(px(24.0)).child(queue_view)),
+                )
+                .into_any_element()
+        } else {
+            match layout {
+            // Cover (or spinning vinyl) and controls beside the lyrics (or full playlist), centred as one group.
             StageLayout::Side => {
                 let size = (area * 0.62).min(vw * 0.3).clamp(240.0, 640.0);
                 let gap = (vw * 0.05).clamp(40.0, 110.0);
@@ -818,7 +1123,11 @@ impl NabyTune {
                 let column = room.min(size * 1.45).min(860.0);
                 let cover = cover_frame.apply(self.stage_cover(size, (size * 0.035).max(10.0), window, cx));
                 let info = self.stage_info(&track, None, size, self.vinyl_mode, cx);
-                let lyrics = self.lyric_column(&lyric_style((vh * 0.04).min(column * 0.058).clamp(20.0, 48.0), 0.42), window, cx);
+                let right_pane: AnyElement = if self.stage_queue {
+                    self.stage_queue_panel(cx)
+                } else {
+                    self.lyric_column(&lyric_style((vh * 0.04).min(column * 0.058).clamp(20.0, 48.0), 0.42), window, cx)
+                };
                 let left_col = div()
                     .w(px(size))
                     .flex_none()
@@ -842,7 +1151,7 @@ impl NabyTune {
                             .items_center()
                             .gap(px(gap))
                             .child(left_col)
-                            .child(div().w(px(column)).flex_none().h_full().py(px(24.0)).child(lyrics)),
+                            .child(div().w(px(column)).flex_none().h_full().py(px(24.0)).child(right_pane)),
                     )
                     .into_any_element()
             }
@@ -854,8 +1163,12 @@ impl NabyTune {
                 let column = room.min(size * 1.45).min(860.0);
                 let cover = cover_frame.apply(self.stage_cover(size, (size * 0.035).max(10.0), window, cx));
                 let info = self.stage_info(&track, None, size, true, cx);
-                let lyrics = self.lyric_column(&lyric_style((vh * 0.04).min(column * 0.058).clamp(20.0, 48.0), 0.42), window, cx);
-                let up_next = self.stage_up_next(size, cx);
+                let right_pane: AnyElement = if self.stage_queue {
+                    self.stage_queue_panel(cx)
+                } else {
+                    self.lyric_column(&lyric_style((vh * 0.04).min(column * 0.058).clamp(20.0, 48.0), 0.42), window, cx)
+                };
+                let up_next = (!self.stage_queue).then(|| self.stage_up_next(size, cx)).flatten();
                 let mut left_col = div()
                     .w(px(size))
                     .flex_none()
@@ -882,7 +1195,7 @@ impl NabyTune {
                             .items_center()
                             .gap(px(gap))
                             .child(left_col)
-                            .child(div().w(px(column)).flex_none().h_full().py(px(24.0)).child(lyrics)),
+                            .child(div().w(px(column)).flex_none().h_full().py(px(24.0)).child(right_pane)),
                     )
                     .into_any_element()
             }
@@ -906,13 +1219,17 @@ impl NabyTune {
                     .child(info)
                     .into_any_element()
             }
-            // The cover is the room: a big title bottom-left (with floating vinyl when Vinyl mode is on), the lyrics up the right.
+            // The cover is the room: a big title bottom-left (with floating vinyl when Vinyl mode is on), the lyrics (or playlist) up the right.
             StageLayout::Bleed => {
                 let title = (vh * 0.065).clamp(34.0, 76.0);
                 let seek = self.seek_line("stage-seek", self.stage_seek.clone(), (vw * 0.28).clamp(260.0, 520.0), cx);
                 let transport = self.transport(true, cx);
                 let lyrics_width = vw * 0.42 - RAIL_ROOM * 0.5;
-                let lyrics = self.lyric_column(&lyric_style((vh * 0.032).min(lyrics_width * 0.06).clamp(20.0, 40.0), 0.45), window, cx);
+                let right_pane: AnyElement = if self.stage_queue {
+                    self.stage_queue_panel(cx)
+                } else {
+                    self.lyric_column(&lyric_style((vh * 0.032).min(lyrics_width * 0.06).clamp(20.0, 40.0), 0.45), window, cx)
+                };
                 let bleed_vinyl = self.vinyl_mode.then(|| {
                     let vsize = (area * 0.42).min(vw * 0.24).clamp(180.0, 340.0);
                     cover_frame.apply(self.vinyl_disc(vsize, window, cx))
@@ -923,7 +1240,7 @@ impl NabyTune {
                     .gap(px(64.0))
                     .pl(px(64.0))
                     .pr(px(RAIL_ROOM + 12.0))
-                    .pb(px(48.0))
+                    .pb(px(40.0))
                     .child(
                         div()
                             .flex_1()
@@ -948,7 +1265,7 @@ impl NabyTune {
                             .child(div().pt_3().child(seek))
                             .child(transport),
                     )
-                    .child(div().w(px(lyrics_width)).flex_none().h_full().py(px(24.0)).child(lyrics))
+                    .child(div().w(px(lyrics_width)).flex_none().h_full().py(px(24.0)).child(right_pane))
                     .into_any_element()
             }
             // The words are the show: lyrics large across the middle, the song small below.
@@ -1033,6 +1350,7 @@ impl NabyTune {
                     )
                     .into_any_element()
             }
+        }
         };
 
         let drop = leaving.map_or(0.0, |k| k * vh * 0.75);

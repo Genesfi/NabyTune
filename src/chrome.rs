@@ -149,8 +149,9 @@ impl NabyTune {
         };
         let mut list = div().id("up-next").flex_1().min_h_0().overflow_y_scroll().px_2().pb_3().flex().flex_col();
         let queue = self.queue.clone();
-        for (j, track) in queue.iter().enumerate().skip(i) {
+        for (j, track) in queue.iter().enumerate() {
             let here = j == i;
+            let played = j < i;
             list = list.child(
                 div()
                     .id(("next", j))
@@ -162,7 +163,8 @@ impl NabyTune {
                     .gap_3()
                     .rounded(px(6.0))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgba(SUBTLE)))
+                    .when(played, |d| d.opacity(0.65).hover(|s| s.opacity(1.0).bg(rgba(SUBTLE))))
+                    .when(!played, |d| d.hover(|s| s.bg(rgba(SUBTLE))))
                     .when(here, |d| d.bg(rgba(SUBTLE_STRONG)))
                     .child(artwork(self.art.get(&track.video_id).map(|a| a.small.clone()), 36.0, 5.0))
                     .child(
@@ -233,7 +235,7 @@ impl NabyTune {
                     .child(div().size(px(6.0)).rounded_full().bg(rgb(accent())))
                     .child(t("Finding similar vibes…")),
             );
-        } else if !self.autoplay && self.queue.len().saturating_sub(i + 1) == 0 {
+        } else if !self.autoplay && self.repeat == Repeat::Off && self.queue.len().saturating_sub(i + 1) == 0 {
             list = list.child(
                 div()
                     .id("up-next-enable-autoplay")
@@ -267,6 +269,8 @@ impl NabyTune {
         }
 
         let autoplay_on = self.autoplay;
+        let loop_locked = self.repeat != Repeat::Off;
+        let autoplay_active = autoplay_on && !loop_locked;
         let autoplay_toggle = div()
             .id("up-next-autoplay")
             .h(px(26.0))
@@ -277,22 +281,23 @@ impl NabyTune {
             .items_center()
             .gap(px(6.0))
             .border_1()
-            .border_color(if autoplay_on { rgb(accent()) } else { rgba(STROKE) })
-            .bg(if autoplay_on { rgba(0xffffff18) } else { rgba(SUBTLE) })
+            .border_color(if autoplay_active { rgb(accent()) } else { rgba(STROKE) })
+            .bg(if autoplay_active { rgba(0xffffff18) } else { rgba(SUBTLE) })
+            .when(autoplay_on && loop_locked, |d| d.opacity(0.6))
             .hover(|s| s.bg(rgba(SUBTLE_STRONG)))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_autoplay(cx)))
             .child(
                 div()
                     .size(px(6.0))
                     .rounded_full()
-                    .bg(if autoplay_on { rgb(accent()) } else { rgba(TERTIARY) }),
+                    .bg(if autoplay_active { rgb(accent()) } else { rgba(TERTIARY) }),
             )
             .child(
                 div()
                     .text_size(px(11.5))
-                    .font_weight(if autoplay_on { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
-                    .text_color(if autoplay_on { rgb(0xffffff) } else { rgba(SECONDARY) })
-                    .child(t("Autoplay")),
+                    .font_weight(if autoplay_active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                    .text_color(if autoplay_active { rgb(0xffffff) } else { rgba(SECONDARY) })
+                    .child(if autoplay_on && loop_locked { "Autoplay (Loop)" } else { t("Autoplay") }),
             );
 
         div()
@@ -456,7 +461,10 @@ impl NabyTune {
                     Repeat::All => Repeat::One,
                     Repeat::One => Repeat::Off,
                 };
-                cx.notify();
+                if this.repeat != Repeat::Off {
+                    this.autoplay_fetching = None;
+                }
+                this.queue_changed(cx);
             })))
             // Full screen: the volume too, under the buttons (the dock is out of reach), as one
             // button; its slider shows once it's clicked.

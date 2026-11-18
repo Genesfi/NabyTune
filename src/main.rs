@@ -792,6 +792,8 @@ struct NabyTune {
 
     // ---- The full-screen player
     full_screen: bool,
+    /// Showing the full playlist/queue instead of lyrics in the full-screen stage.
+    stage_queue: bool,
     stage_layout: StageLayout,
     stage_backdrop: StageBackdrop,
     /// What moves with the music behind the full-screen player.
@@ -1121,6 +1123,7 @@ impl NabyTune {
             repeat: Repeat::Off,
             muted: std::env::var_os("NABYTUNE_PROTO_MUTE").is_some(),
             full_screen: false,
+            stage_queue: false,
             stage_layout: settings::get("stage_layout").and_then(|k| StageLayout::from_key(&k)).unwrap_or(StageLayout::Side),
             stage_backdrop: settings::get("stage_backdrop").and_then(|k| StageBackdrop::from_key(&k)).unwrap_or(StageBackdrop::Ambient),
             visual: settings::get("visualizer").and_then(|k| visualizer::Visual::from_key(&k)).unwrap_or(visualizer::Visual::Pulse),
@@ -1502,6 +1505,9 @@ impl Render for NabyTune {
                     Repeat::All => Repeat::One,
                     Repeat::One => Repeat::Off,
                 };
+                if this.repeat != Repeat::Off {
+                    this.autoplay_fetching = None;
+                }
                 this.queue_changed(cx);
             }))
             // The mouse's back button: the page before, or out of full screen.

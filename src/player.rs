@@ -105,10 +105,11 @@ impl NabyTune {
         cx.notify();
     }
 
-    /// Keeps Up Next stocked with vibe-matched recommendations whenever Autoplay is on
-    /// and 2 or fewer upcoming songs remain.
+    /// Keeps Up Next stocked with vibe-matched recommendations whenever Autoplay is on,
+    /// Repeat is off, and 2 or fewer upcoming songs remain.
     pub(crate) fn ensure_autoplay(&mut self, cx: &mut Context<Self>) {
-        if !self.autoplay || self.radio.is_some() || self.repeat == Repeat::One {
+        if !self.autoplay || self.radio.is_some() || self.repeat != Repeat::Off {
+            self.autoplay_fetching = None;
             return;
         }
         let Some(i) = self.index else { return };
@@ -184,7 +185,7 @@ impl NabyTune {
 
             let _ = this.update(cx, |app, cx| {
                 app.autoplay_fetching = None;
-                if !app.autoplay || app.radio.is_some() {
+                if !app.autoplay || app.radio.is_some() || app.repeat != Repeat::Off {
                     cx.notify();
                     return;
                 }
