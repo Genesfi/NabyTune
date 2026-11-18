@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -128,6 +129,12 @@ impl ITaskbarList3 {
         let _ = ((*(*tbl).vtbl).set_thumbnail_tooltip)(tbl as *mut c_void, hwnd, wide.as_ptr());
     }
 
+    unsafe fn add_ref(tbl: *mut ITaskbarList3) {
+        if !tbl.is_null() {
+            ((*(*tbl).vtbl).add_ref)(tbl as *mut c_void);
+        }
+    }
+
     unsafe fn release(tbl: *mut ITaskbarList3) {
         if !tbl.is_null() {
             ((*(*tbl).vtbl).release)(tbl as *mut c_void);
@@ -182,6 +189,9 @@ struct HookState {
     msg_taskbar_created: u32,
     tbl: *mut ITaskbarList3,
     icons: Icons,
+    /// Icons swapped out while an out-of-proc COM call is mid-flight; destroyed once `in_com == 0`.
+    retired_icons: Vec<Icons>,
+    in_com: u32,
     playing: bool,
     added: bool,
     tx: Sender<TaskbarEvent>,
@@ -200,34 +210,6 @@ impl HookState {
             thumb_btn(BTN_NEXT, self.icons.next, t("Next")),
         ]
     }
-
-    fn apply_buttons(&mut self, hwnd: HWND, force_add: bool) {
-        if self.tbl.is_null() {
-            return;
-        }
-        let buttons = self.make_buttons();
-        unsafe {
-            if force_add || !self.added {
-                if ITaskbarList3::add_buttons(self.tbl, hwnd, &buttons) {
-                    self.added = true;
-                } else {
-                    let _ = ITaskbarList3::update_buttons(self.tbl, hwnd, &buttons);
-                    self.added = true;
-                }
-            } else {
-                let _ = ITaskbarList3::update_buttons(self.tbl, hwnd, &buttons);
-            }
-        }
-    }
-
-    fn refresh_theme(&mut self, hwnd: HWND) {
-        let light = is_system_light_theme();
-        if light != self.icons.light_theme {
-            self.icons.destroy();
-            self.icons = Icons::build(light);
-            self.apply_buttons(hwnd, false);
-        }
-    }
 }
 
 impl Drop for HookState {
@@ -241,6 +223,98 @@ impl Drop for HookState {
 
 thread_local! {
     static HOOKED: RefCell<HashMap<isize, HookState>> = RefCell::new(HashMap::new());
+}
+
+/// Calls `ITaskbarList3::ThumbBarAddButtons` / `ThumbBarUpdateButtons` with NO `HOOKED` borrow held.
+///
+/// Out-of-proc STA COM calls pump the thread's Win32 message queue while waiting on Explorer,
+/// which synchronously re-enters `wnd_proc` on this same thread. Holding a `RefCell` borrow
+/// across COM would panic with "RefCell already borrowed".
+fn apply_buttons_for(hwnd_val: isize, force_add: bool) {
+    let snapshot = HOOKED.with(|h| {
+        let Ok(mut map) = h.try_borrow_mut() else { return None };
+        let state = map.get_mut(&hwnd_val)?;
+        if state.tbl.is_null() {
+            return None;
+        }
+        let tbl = state.tbl;
+        unsafe { ITaskbarList3::add_ref(tbl) };
+        state.in_com += 1;
+        let buttons = state.make_buttons();
+        let do_add = force_add || !state.added;
+        Some((tbl, buttons, do_add))
+    });
+
+    let Some((tbl, buttons, do_add)) = snapshot else { return };
+    let hwnd = hwnd_val as HWND;
+
+    unsafe {
+        if do_add {
+            if !ITaskbarList3::add_buttons(tbl, hwnd, &buttons) {
+                let _ = ITaskbarList3::update_buttons(tbl, hwnd, &buttons);
+            }
+        } else {
+            let _ = ITaskbarList3::update_buttons(tbl, hwnd, &buttons);
+        }
+        ITaskbarList3::release(tbl);
+    }
+
+    let to_drop = HOOKED.with(|h| {
+        let Ok(mut map) = h.try_borrow_mut() else { return Vec::new() };
+        if let Some(state) = map.get_mut(&hwnd_val) {
+            state.added = true;
+            state.in_com = state.in_com.saturating_sub(1);
+            if state.in_com == 0 && !state.retired_icons.is_empty() {
+                return std::mem::take(&mut state.retired_icons);
+            }
+        }
+        Vec::new()
+    });
+    drop(to_drop);
+}
+
+fn set_tooltip_for(hwnd_val: isize, tip: &str) {
+    let tbl = HOOKED.with(|h| {
+        let Ok(map) = h.try_borrow() else { return None };
+        let state = map.get(&hwnd_val)?;
+        if state.tbl.is_null() {
+            return None;
+        }
+        unsafe { ITaskbarList3::add_ref(state.tbl) };
+        Some(state.tbl)
+    });
+    if let Some(tbl) = tbl {
+        unsafe {
+            ITaskbarList3::set_tooltip(tbl, hwnd_val as HWND, tip);
+            ITaskbarList3::release(tbl);
+        }
+    }
+}
+
+fn refresh_theme_for(hwnd_val: isize) {
+    let light = is_system_light_theme();
+    let needs_rebuild = HOOKED.with(|h| {
+        let Ok(map) = h.try_borrow() else { return false };
+        map.get(&hwnd_val).is_some_and(|s| s.icons.light_theme != light)
+    });
+    if !needs_rebuild {
+        return;
+    }
+
+    let new_icons = Icons::build(light);
+    let old_icons = HOOKED.with(|h| {
+        let Ok(mut map) = h.try_borrow_mut() else { return Some(new_icons) };
+        let Some(state) = map.get_mut(&hwnd_val) else { return Some(new_icons) };
+        let prev = std::mem::replace(&mut state.icons, new_icons);
+        if state.in_com == 0 {
+            Some(prev)
+        } else {
+            state.retired_icons.push(prev);
+            None
+        }
+    });
+    drop(old_icons);
+    apply_buttons_for(hwnd_val, false);
 }
 
 /// Windows Taskbar thumbnail media controls attached to the main window.
@@ -275,21 +349,23 @@ impl Taskbar {
             return None;
         }
 
-        let mut state = HookState {
+        let state = HookState {
             original,
             msg_taskbar_created,
             tbl,
             icons,
+            retired_icons: Vec::new(),
+            in_com: 0,
             playing: false,
             added: false,
             tx,
         };
-        // Register immediately if taskbar button already exists; TaskbarButtonCreated will re-add if needed.
-        state.apply_buttons(hwnd, true);
-
+        // Insert BEFORE calling COM so re-entrant Win32 messages during ThumbBarAddButtons
+        // still forward cleanly to GPUI's original WndProc.
         HOOKED.with(|h| {
             h.borrow_mut().insert(hwnd_val, state);
         });
+        apply_buttons_for(hwnd_val, true);
 
         Some(Self { hwnd: hwnd_val, rx })
     }
@@ -301,87 +377,96 @@ impl Taskbar {
 
     /// Updates the center Play / Pause button icon and tooltip.
     pub fn set_playing(&self, playing: bool) {
-        HOOKED.with(|h| {
-            if let Some(state) = h.borrow_mut().get_mut(&self.hwnd) {
+        let changed = HOOKED.with(|h| {
+            let Ok(mut map) = h.try_borrow_mut() else { return false };
+            if let Some(state) = map.get_mut(&self.hwnd) {
                 if state.playing != playing {
                     state.playing = playing;
-                    state.apply_buttons(self.hwnd as HWND, false);
+                    return true;
                 }
             }
+            false
         });
+        if changed {
+            apply_buttons_for(self.hwnd, false);
+        }
     }
 
     /// Updates the hover tooltip shown on the taskbar thumbnail preview.
     pub fn set_tooltip(&self, tip: &str) {
-        HOOKED.with(|h| {
-            if let Some(state) = h.borrow().get(&self.hwnd) {
-                if !state.tbl.is_null() {
-                    unsafe { ITaskbarList3::set_tooltip(state.tbl, self.hwnd as HWND, tip) };
-                }
-            }
-        });
+        set_tooltip_for(self.hwnd, tip);
     }
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let key = hwnd as isize;
-    enum Action {
-        Pass(isize),
-        Handled,
-        Unhook(isize),
-    }
-
-    let action = HOOKED.with(|h| {
-        let mut map = h.borrow_mut();
-        let state = map.get_mut(&key)?;
-        if msg == state.msg_taskbar_created && msg != 0 {
-            state.added = false;
-            state.apply_buttons(hwnd, true);
-            return Some(Action::Pass(state.original));
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let key = hwnd as isize;
+        enum Action {
+            Pass(isize),
+            TaskbarCreated(isize),
+            SettingChange(isize),
+            Handled,
+            Unhook(isize, Option<HookState>),
         }
-        match msg {
-            WM_COMMAND if ((wparam >> 16) & 0xFFFF) as u32 == THBN_CLICKED => {
-                match (wparam & 0xFFFF) as u32 {
-                    BTN_PREV => {
-                        let _ = state.tx.send(TaskbarEvent::Previous);
+
+        let action = HOOKED.with(|h| {
+            let Ok(mut map) = h.try_borrow_mut() else { return None };
+            let state = map.get_mut(&key)?;
+            if msg == state.msg_taskbar_created && msg != 0 {
+                state.added = false;
+                return Some(Action::TaskbarCreated(state.original));
+            }
+            match msg {
+                WM_COMMAND if ((wparam >> 16) & 0xFFFF) as u32 == THBN_CLICKED => {
+                    match (wparam & 0xFFFF) as u32 {
+                        BTN_PREV => {
+                            let _ = state.tx.send(TaskbarEvent::Previous);
+                        }
+                        BTN_PLAY_PAUSE => {
+                            let _ = state.tx.send(TaskbarEvent::PlayPause);
+                        }
+                        BTN_NEXT => {
+                            let _ = state.tx.send(TaskbarEvent::Next);
+                        }
+                        _ => return Some(Action::Pass(state.original)),
                     }
-                    BTN_PLAY_PAUSE => {
-                        let _ = state.tx.send(TaskbarEvent::PlayPause);
-                    }
-                    BTN_NEXT => {
-                        let _ = state.tx.send(TaskbarEvent::Next);
-                    }
-                    _ => return Some(Action::Pass(state.original)),
+                    Some(Action::Handled)
                 }
-                Some(Action::Handled)
+                WM_SETTINGCHANGE => Some(Action::SettingChange(state.original)),
+                WM_NCDESTROY => {
+                    let original = state.original;
+                    let removed = map.remove(&key);
+                    Some(Action::Unhook(original, removed))
+                }
+                _ => Some(Action::Pass(state.original)),
             }
-            WM_SETTINGCHANGE => {
-                state.refresh_theme(hwnd);
-                Some(Action::Pass(state.original))
-            }
-            WM_NCDESTROY => {
-                let original = state.original;
-                map.remove(&key);
-                Some(Action::Unhook(original))
-            }
-            _ => Some(Action::Pass(state.original)),
-        }
-    });
+        });
 
-    let call = |original: isize| {
-        let f: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = std::mem::transmute(original);
-        CallWindowProcW(Some(f), hwnd, msg, wparam, lparam)
-    };
+        let call = |original: isize| {
+            let f: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = std::mem::transmute(original);
+            CallWindowProcW(Some(f), hwnd, msg, wparam, lparam)
+        };
 
-    match action {
-        None => DefWindowProcW(hwnd, msg, wparam, lparam),
-        Some(Action::Handled) => 0,
-        Some(Action::Pass(original)) => call(original),
-        Some(Action::Unhook(original)) => {
-            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, original);
-            call(original)
+        match action {
+            None => DefWindowProcW(hwnd, msg, wparam, lparam),
+            Some(Action::Handled) => 0,
+            Some(Action::Pass(original)) => call(original),
+            Some(Action::TaskbarCreated(original)) => {
+                apply_buttons_for(key, true);
+                call(original)
+            }
+            Some(Action::SettingChange(original)) => {
+                refresh_theme_for(key);
+                call(original)
+            }
+            Some(Action::Unhook(original, removed)) => {
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, original);
+                drop(removed);
+                call(original)
+            }
         }
-    }
+    }))
+    .unwrap_or_else(|_| unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) })
 }
 
 fn thumb_btn(id: u32, hicon: HICON, tip: &str) -> THUMBBUTTON {
